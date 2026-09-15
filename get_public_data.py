@@ -32,9 +32,9 @@ call ='wget http://webeye.ophth.uiowa.edu/abramoff/AV_groundTruth.zip ' \
       '&& mv data/DRIVE/AV_groundTruth/test/av/* data/DRIVE/manual_av && rm -r data/DRIVE/AV_groundTruth'
 os.system(call)
 
-# call ='wget http://iflexis.com/downloads/HRF_AV_GT.zip ' \
-#       '&& unzip HRF_AV_GT.zip -d data/HRF && rm HRF_AV_GT.zip && mv data/HRF/HRF_AV_GT data/HRF/manual_av'
-# os.system(call)
+call ='wget http://iflexis.com/downloads/HRF_AV_GT.zip ' \
+      '&& unzip HRF_AV_GT.zip -d data/HRF && rm HRF_AV_GT.zip && mv data/HRF/HRF_AV_GT data/HRF/manual_av'
+os.system(call)
 
 call = '(wget https://www5.cs.fau.de/fileadmin/research/datasets/fundus-images/all.zip ' \
        '&& unzip all.zip -d data/HRF && mv data/HRF/manual1 data/HRF/manual' \
@@ -397,46 +397,47 @@ print('All public data prepared, ready to go.')
 print('NOTE: The Les-AV dataset is hosted at figshare now, see get_public_data.py Line 400 forward for details.')
 print(104*'-')
 ########################################################################################################################
-# What you can see below are the old instructions to download the LES-AV dataset. Since the release of this codebase,
-# LES-AV has been removed from the public url we used to employ for downloading it and hosted at figshare, which allows
-# free downloading, but as far as I know it needs to be done manually. Please head to the following url:
-#
-# https://figshare.com/articles/dataset/LES-AV_dataset/11857698
-#
-# download the LES-AV.zip file and then reproduce the steps below accordingly, sorry for the inconvenience. Adrian.
+# LES-AV dataset: check if LES-AV.zip exists locally. If not, prompt user to download manually.
 ########################################################################################################################
-# call = '(wget https://ignaciorlando.github.io/static/data/LES-AV.zip && unzip LES-AV.zip -d data/LES-AV ' \
-#        '&& rm LES-AV.zip && mv data/LES-AV data/LES_AV' \
-#        '&& rm -r data/LES_AV/__MACOSX)'
-# os.system(call)
-#
-# call = '(mkdir data/LES-AV ' \
-#        '&& mv data/LES_AV/LES-AV/images data/LES-AV/images ' \
-#        '&& mv data/LES_AV/LES-AV/masks data/LES-AV/mask ' \
-#        '&& mv data/LES_AV/LES-AV/vessel-segmentations data/LES-AV/manual' \
-#        '&& mv data/LES_AV/LES-AV/arteries-and-veins data/LES-AV/manual_av ' \
-#        '&& rm -r data/LES_AV)'
-# os.system(call)
+if not os.path.exists('LES-AV.zip'):
+    print('LES-AV.zip not found. Please download the LES-AV dataset from:')
+    print('https://figshare.com/articles/dataset/LES-AV_dataset/11857698')
+    print('Place the LES-AV.zip file in the project root directory and re-run this script.')
+    
+else:
+    print('LES-AV.zip found, extracting...')
+    call = '(unzip -oq LES-AV.zip -d data/LES-AV ' \
+        '&& rm LES-AV.zip && mv data/LES-AV data/LES_AV ' \
+        '&& rm -r data/LES_AV/__MACOSX)'
+    os.system(call)
 
-# path_ims = 'data/LES-AV/images'
-# path_masks = 'data/LES-AV/mask'
-# path_gts = 'data/LES-AV/manual'
-#
-# all_im_names = sorted(os.listdir(path_ims))
-# all_mask_names = sorted(os.listdir(path_masks))
-# all_gt_names = sorted(os.listdir(path_gts))
-#
-# all_im_names = [osp.join(path_ims, n) for n in all_im_names]
-# all_mask_names = [osp.join(path_masks, n) for n in all_mask_names]
-# all_gt_names = [osp.join(path_gts, n) for n in all_gt_names]
-#
-# df_lesav_all = pd.DataFrame({'im_paths': all_im_names,
-#                              'gt_paths': all_gt_names,
-#                              'mask_paths': all_mask_names})
-# df_lesav_all.to_csv('data/LES-AV/test_all.csv', index=False)
-#
-# # create data/LES_AV/test_av.csv:
-# df_lesav_all.gt_paths = [n.replace('manual', 'manual_av') for n in df_lesav_all.gt_paths]
-# df_lesav_all.to_csv('data/LES-AV/test_all_av.csv', index=None)
-# print('LES-AV prepared')
+    call = '(mkdir -p data/LES-AV ' \
+        '&& mv data/LES_AV/LES-AV/images data/LES-AV/images ' \
+        '&& mv data/LES_AV/LES-AV/masks data/LES-AV/mask ' \
+        '&& mv data/LES_AV/LES-AV/vessel-segmentations data/LES-AV/manual ' \
+        '&& mv data/LES_AV/LES-AV/arteries-and-veins data/LES-AV/manual_av ' \
+        '&& rm -r data/LES_AV)'
+    os.system(call)
+
+    path_ims = 'data/LES-AV/images'
+    path_masks = 'data/LES-AV/mask'
+    path_gts = 'data/LES-AV/manual'
+
+    all_im_names = sorted(os.listdir(path_ims))
+    all_mask_names = sorted(os.listdir(path_masks))
+    all_gt_names = sorted(os.listdir(path_gts))
+
+    all_im_names = [osp.join(path_ims, n) for n in all_im_names]
+    all_mask_names = [osp.join(path_masks, n) for n in all_mask_names]
+    all_gt_names = [osp.join(path_gts, n) for n in all_gt_names]
+
+    df_lesav_all = pd.DataFrame({'im_paths': all_im_names,
+                                'gt_paths': all_gt_names,
+                                'mask_paths': all_mask_names})
+    df_lesav_all.to_csv('data/LES-AV/test_all.csv', index=False)
+
+    # create data/LES-AV/test_av.csv:
+    df_lesav_all.gt_paths = [n.replace('manual', 'manual_av') for n in df_lesav_all.gt_paths]
+    df_lesav_all.to_csv('data/LES-AV/test_all_av.csv', index=None)
+    print('LES-AV prepared')
 
