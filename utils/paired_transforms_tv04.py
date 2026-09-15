@@ -16,9 +16,24 @@ import warnings
 
 from torchvision.transforms import functional as F
 import torchvision.transforms as T
-import pkg_resources
-import distutils.version
-TORCHVISION_VERSION = distutils.version.LooseVersion(pkg_resources.require('torchvision')[0].version)
+from importlib.metadata import version as package_version
+from packaging.version import Version
+
+# TODO: Remove this version branch once support for torchvision <= 0.4.2 is dropped.
+TORCHVISION_VERSION = Version(package_version('torchvision'))
+
+
+def _legacy_resample_to_interpolation(resample):
+    """Convert the old torchvision/Pillow resample value to a modern enum."""
+    if resample is None or resample is False:
+        return T.InterpolationMode.NEAREST
+    if isinstance(resample, T.InterpolationMode):
+        return resample
+    return {
+        Image.NEAREST: T.InterpolationMode.NEAREST,
+        Image.BILINEAR: T.InterpolationMode.BILINEAR,
+        Image.BICUBIC: T.InterpolationMode.BICUBIC,
+    }[resample]
 
 if sys.version_info < (3, 3):
     Sequence = collections.Sequence
@@ -1121,7 +1136,7 @@ class RandomRotation(object):
 
         angle = self.get_params(self.degrees)
 
-        if TORCHVISION_VERSION <= distutils.version.LooseVersion("0.4.2"):
+        if TORCHVISION_VERSION <= Version("0.4.2"):
             # the "fill" argument was only introduced in torchvision==0.5.0
             if target is not None:
                 return F.rotate(img, angle, self.resample, self.expand, self.center), \
@@ -1131,10 +1146,12 @@ class RandomRotation(object):
 
         else:
             if target is not None:
-                return F.rotate(img, angle, self.interpolation, self.expand, self.center, self.fill, resample=None), \
-                       F.rotate(target, angle, self.interpolation_tg, self.expand, self.center, self.fill_tg, resample=None) #
+                # TODO: Use only the modern interpolation API after the legacy branch is removed.
+                return F.rotate(img, angle, self.interpolation, self.expand, self.center, self.fill), \
+                       F.rotate(target, angle, self.interpolation_tg, self.expand, self.center, self.fill_tg) #
                        # resample = False is by default nearest, appropriate for targets
-            return F.rotate(img, angle, self.interpolation, self.expand, self.center, self.fill_tg, resample=None)
+            # TODO: Use only the modern interpolation API after the legacy branch is removed.
+            return F.rotate(img, angle, self.interpolation, self.expand, self.center, self.fill_tg)
 
     def __repr__(self):
         format_string = self.__class__.__name__ + '(degrees={0}'.format(self.degrees)
@@ -1266,10 +1283,15 @@ class RandomAffine(object):
         """
         ret = self.get_params(self.degrees, self.translate, self.scale, self.shear, img.size)
         if target is not None:
-            return F.affine(img, *ret, resample=self.resample, fill=self.fill), \
-                   F.affine(target, *ret, resample=self.resample_tg, fill=self.fill)
+            # TODO: Replace legacy resample values with explicit InterpolationMode values.
+            interpolation = _legacy_resample_to_interpolation(self.resample)
+            target_interpolation = _legacy_resample_to_interpolation(self.resample_tg)
+            return F.affine(img, *ret, interpolation=interpolation, fill=self.fill), \
+                   F.affine(target, *ret, interpolation=target_interpolation, fill=self.fill)
                    # resample = False is by default nearest, appropriate for targets
-        return F.affine(img, *ret, resample=self.resample, fill=self.fill)
+        # TODO: Replace legacy resample values with an explicit InterpolationMode value.
+        interpolation = _legacy_resample_to_interpolation(self.resample)
+        return F.affine(img, *ret, interpolation=interpolation, fill=self.fill)
 
     def __repr__(self):
         s = '{name}(degrees={degrees}'
