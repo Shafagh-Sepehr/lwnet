@@ -9,15 +9,49 @@ from PIL import Image
 import numpy as np
 from skimage.measure import regionprops
 import torch
+from torchvision.transforms import functional as tvtF
+from torchvision.transforms import InterpolationMode
+
+from .freesdg_aug import FreeSDGAugmentor
 
 class TrainDataset(Dataset):
-    def __init__(self, csv_path, transforms=None, label_values=None):
+    def __init__(self, csv_path, transforms=None, label_values=None, freesdg_cfg=None):
         df = pd.read_csv(csv_path)
         self.im_list = df.im_paths
         self.gt_list = df.gt_paths
         self.mask_list = df.mask_paths
         self.transforms = transforms
         self.label_values = label_values  # for use in label_encoding
+        # Opt-in FreeSDG FMAug configuration (plan §10). None/disabled ->
+        # the original code path below executes verbatim.
+        self.freesdg_cfg = freesdg_cfg
+        self.freesdg_resize = None  # hoisted deterministic resize (set by get_train_val_datasets)
+        self._freesdg_augmentor = None
+        self._freesdg_mask_resize = None
+
+    def _freesdg_enabled(self):
+        return self.freesdg_cfg is not None and self.freesdg_cfg.get('enabled', False)
+
+    def _get_freesdg_augmentor(self):
+        if self._freesdg_augmentor is None:
+            cfg = self.freesdg_cfg
+            self._freesdg_augmentor = FreeSDGAugmentor(
+                seed=cfg.get('seed', 0),
+                ratio=cfg.get('ratio', 4.0),
+                mixup_size=cfg.get('mixup_size', -1),
+                mix_policy=cfg.get('mix_policy', 'repo'),
+                anchor_w=cfg.get('anchor_w', 27),
+                anchor_sigma=cfg.get('anchor_sigma', 9),
+            )
+        return self._freesdg_augmentor
+
+    def _freesdg_mask_tensor(self, mask, hw):
+        # NEAREST resize keeps the FOV mask binary (plan §10.1/§15)
+        if self._freesdg_mask_resize is None:
+            self._freesdg_mask_resize = p_tr.Resize(hw, interpolation=InterpolationMode.NEAREST)
+        elif self._freesdg_mask_resize.size != hw:
+            self._freesdg_mask_resize = p_tr.Resize(hw, interpolation=InterpolationMode.NEAREST)
+        return tvtF.to_tensor(self._freesdg_mask_resize(mask))
 
     def label_encoding(self, gdt):
         gdt_gray = np.array(gdt.convert('L'))
@@ -48,7 +82,30 @@ class TrainDataset(Dataset):
         target[np.array(mask) == 0] = 0
         target = Image.fromarray(target)
 
-        if self.transforms is not None:
+        if self._freesdg_enabled() and self.freesdg_cfg.get('role', 'train') == 'train':
+            # FMAug training path (plan §1.4/§10.1): hoisted deterministic
+            # resize of image+target, NEAREST-resized FOV mask, FMAug on the
+            # [0,1] image, uint8 PIL round-trip (~1/255 quantization, §19.6),
+            # then exactly the remaining original transform order.
+            augmentor = self._get_freesdg_augmentor()
+            img, target = self.freesdg_resize(img, target)
+            img01 = tvtF.to_tensor(img)
+            mask01 = self._freesdg_mask_tensor(mask, tuple(img01.shape[-2:]))
+            img01 = augmentor.augment_train(
+                img01, mask01, raw_prob=self.freesdg_cfg.get('raw_prob', 0.0))
+            img = augmentor.to_pil_uint8(img01)
+            if self.transforms is not None:
+                img, target = self.transforms(img, target)
+        elif self._freesdg_enabled() and self.freesdg_cfg.get('role') == 'val' \
+                and self.freesdg_cfg.get('test_input', 'raw') == 'anchor':
+            # Validation anchor path (plan §7/§10.2): deterministic Resize +
+            # ToTensor as before, then fixed-anchor HFC on the float [0,1]
+            # tensor (no uint8 round-trip on evaluation paths, §8).
+            img, target = self.transforms(img, target)
+            augmentor = self._get_freesdg_augmentor()
+            mask01 = self._freesdg_mask_tensor(mask, tuple(img.shape[-2:]))
+            img = augmentor.anchor(img, mask01)
+        elif self.transforms is not None:
             img, target = self.transforms(img, target)
 
 
@@ -138,10 +195,17 @@ def build_pseudo_dataset(train_csv_path, test_csv_path, path_to_preds):
     return train_im_list, train_gt_list, train_mask_list
 
 
-def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), label_values=(0, 255)):
+def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), label_values=(0, 255), freesdg_cfg=None):
 
-    train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values)
-    val_dataset = TrainDataset(csv_path=csv_path_val, label_values=label_values)
+    freesdg_enabled = freesdg_cfg is not None and freesdg_cfg.get('enabled', False)
+    if freesdg_enabled:
+        train_freesdg_cfg = dict(freesdg_cfg, role='train')
+        val_freesdg_cfg = dict(freesdg_cfg, role='val')
+        train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values, freesdg_cfg=train_freesdg_cfg)
+        val_dataset = TrainDataset(csv_path=csv_path_val, label_values=label_values, freesdg_cfg=val_freesdg_cfg)
+    else:
+        train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values)
+        val_dataset = TrainDataset(csv_path=csv_path_val, label_values=label_values)
     # transforms definition
     # required transforms
     resize = p_tr.Resize(tg_size)
@@ -157,15 +221,22 @@ def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), lab
     # intensity transforms
     brightness, contrast, saturation, hue = 0.25, 0.25, 0.25, 0.01
     jitter = p_tr.ColorJitter(brightness, contrast, saturation, hue)
-    train_transforms = p_tr.Compose([resize,  scale_transl_rot, jitter, h_flip, v_flip, tensorizer])
+    if freesdg_enabled:
+        # The deterministic resize is hoisted ahead of FMAug in
+        # TrainDataset.__getitem__ (same resize instance/interpolations);
+        # the remaining original transform order is kept verbatim (§10.1).
+        train_transforms = p_tr.Compose([scale_transl_rot, jitter, h_flip, v_flip, tensorizer])
+        train_dataset.freesdg_resize = resize
+    else:
+        train_transforms = p_tr.Compose([resize,  scale_transl_rot, jitter, h_flip, v_flip, tensorizer])
     val_transforms = p_tr.Compose([resize, tensorizer])
     train_dataset.transforms = train_transforms
     val_dataset.transforms = val_transforms
 
     return train_dataset, val_dataset
 
-def get_train_val_loaders(csv_path_train, csv_path_val, batch_size=4, tg_size=(512, 512), label_values=(0, 255), num_workers=0):
-    train_dataset, val_dataset = get_train_val_datasets(csv_path_train, csv_path_val, tg_size=tg_size, label_values=label_values)
+def get_train_val_loaders(csv_path_train, csv_path_val, batch_size=4, tg_size=(512, 512), label_values=(0, 255), num_workers=0, freesdg_cfg=None):
+    train_dataset, val_dataset = get_train_val_datasets(csv_path_train, csv_path_val, tg_size=tg_size, label_values=label_values, freesdg_cfg=freesdg_cfg)
 
     train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available(), shuffle=True)
     val_loader = DataLoader(dataset=val_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())

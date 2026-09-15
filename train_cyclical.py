@@ -42,6 +42,16 @@ parser.add_argument('--checkpoint_folder', type=str, default=None, help='path to
 parser.add_argument('--num_workers', type=int, default=0, help='number of parallel (multiprocessing) workers to launch for data loading tasks (handled by pytorch) [default: %(default)s]')
 parser.add_argument('--device', type=str, default='cpu', help='where to run the training code (e.g. "cpu" or "cuda:0") [default: %(default)s]')
 parser.add_argument('--seed', type=int, default=0, help='seed')
+# FreeSDG-style Frequency-Mixed Augmentation (FMAug); see utils/freesdg_aug.py
+parser.add_argument('--freesdg', action='store_true', help='enable FreeSDG FMAug training-time augmentation (dataset-side)')
+parser.add_argument('--freesdg_raw_prob', type=float, default=0.0, help='probability of feeding the raw image instead of the FMAug view during training')
+parser.add_argument('--freesdg_test_input', type=str, default='raw', choices=['raw', 'anchor'], help='validation/inference input policy')
+parser.add_argument('--freesdg_anchor_w', type=int, default=27, help='anchor HFC Gaussian kernel width')
+parser.add_argument('--freesdg_anchor_sigma', type=float, default=9, help='anchor HFC Gaussian sigma')
+parser.add_argument('--freesdg_ratio', type=float, default=4.0, help='HFC residual amplification ratio (bank and anchor)')
+parser.add_argument('--freesdg_mixup_size', type=int, default=-1, help='FMAug rectangle size: -1 random (repo policy) or >0 fixed square; 0 is invalid')
+parser.add_argument('--freesdg_mix_policy', type=str, default='repo', choices=['repo', 'paper'], help='FMAug rectangle sampling policy')
+parser.add_argument('--freesdg_seed', type=int, default=0, help='dedicated seed for the isolated FMAug RNG stream')
 
 
 def compare_op(metric):
@@ -200,6 +210,33 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    # FreeSDG FMAug argument validation (plan §11)
+    if args.freesdg:
+        if not (0.0 <= args.freesdg_raw_prob <= 1.0):
+            sys.exit('--freesdg_raw_prob must be within [0, 1]')
+        if args.freesdg_mixup_size == 0 or args.freesdg_mixup_size < -1:
+            sys.exit('--freesdg_mixup_size must be -1 (random) or > 0 (fixed square); 0 is not a valid mode')
+
+    im_size_tmp = tuple([int(item) for item in args.im_size.split(',')])
+    tg_size_tmp = (im_size_tmp[0], im_size_tmp[0]) if len(im_size_tmp) == 1 else tuple(im_size_tmp[:2])
+    if args.freesdg and args.freesdg_mix_policy == 'paper' and tg_size_tmp != (512, 512):
+        sys.exit('--freesdg_mix_policy paper requires 512x512 input (--im_size 512)')
+
+    if args.freesdg:
+        freesdg_cfg = {
+            'enabled': True,
+            'raw_prob': args.freesdg_raw_prob,
+            'test_input': args.freesdg_test_input,
+            'anchor_w': args.freesdg_anchor_w,
+            'anchor_sigma': args.freesdg_anchor_sigma,
+            'ratio': args.freesdg_ratio,
+            'mixup_size': args.freesdg_mixup_size,
+            'mix_policy': args.freesdg_mix_policy,
+            'seed': args.freesdg_seed,
+        }
+    else:
+        freesdg_cfg = None
+
     if args.device.startswith("cuda"):
         # In case one has multiple devices, we must first set the one
         # we would like to use so pytorch can find it.
@@ -259,7 +296,7 @@ if __name__ == '__main__':
 
 
     print("* Creating Dataloaders, batch size = {}, workers = {}".format(bs, args.num_workers))
-    train_loader, val_loader = get_train_val_loaders(csv_path_train=csv_train, csv_path_val=csv_val, batch_size=bs, tg_size=tg_size, label_values=label_values, num_workers=args.num_workers)
+    train_loader, val_loader = get_train_val_loaders(csv_path_train=csv_train, csv_path_val=csv_val, batch_size=bs, tg_size=tg_size, label_values=label_values, num_workers=args.num_workers, freesdg_cfg=freesdg_cfg)
 
     # grad_acc_steps: if I want to train with a fake_bs=K but the actual bs I want is bs=N, then you use
     # grad_acc_steps = N/K - 1.

@@ -27,6 +27,8 @@ parser.add_argument('--bin_thresh', type=float, default='0.4196', help='binarizi
 parser.add_argument('--im_size', help='delimited list input, could be 600,400', type=str, default='512')
 parser.add_argument('--device', type=str, default='cpu', help='where to run the training code (e.g. "cpu" or "cuda:0") [default: %(default)s]')
 parser.add_argument('--result_path', type=str, default=None, help='path to save prediction)')
+# FreeSDG FMAug eval-input override (plan §13): None -> config value -> raw
+parser.add_argument('--freesdg_test_input', type=str, default=None, choices=['raw', 'anchor'], help='override FreeSDG eval input policy (raw/anchor); default: model config value or raw')
 
 from skimage import measure, draw
 import numpy as np
@@ -103,9 +105,14 @@ def flip_lr(tens):
 def flip_lrud(tens):
     return torch.flip(tens, dims=[1, 2])
 
-def create_pred(model, tens, mask, coords_crop, original_sz, bin_thresh, tta='no'):
+def create_pred(model, tens, mask, coords_crop, original_sz, bin_thresh, tta='no', device=None):
     act = torch.sigmoid if model.n_classes == 1 else torch.nn.Softmax(dim=0)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # NOTE (unrelated upstream bug fix, kept separate from FreeSDG logic):
+    # create_pred previously always picked cuda-if-available, ignoring the
+    # CLI-selected --device; it now receives the caller's device and only
+    # falls back to the old behavior when not passed.
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     with torch.no_grad():
         logits = model(tens.unsqueeze(dim=0).to(device)).squeeze(dim=0)
     pred = act(logits)
@@ -153,6 +160,29 @@ if __name__ == '__main__':
     bin_thresh = args.bin_thresh
     tta = args.tta
 
+    # FreeSDG preprocessing recovery from model_path/config.cfg (plan §13):
+    # the config is used ONLY to recover FreeSDG-related preprocessing fields;
+    # resolution: CLI override -> config value -> raw fallback. No config ->
+    # FreeSDG disabled, existing behavior.
+    import json
+    model_cfg = {}
+    config_file = osp.join(args.model_path, 'config.cfg')
+    if osp.isfile(config_file):
+        with open(config_file, 'r') as f:
+            model_cfg = json.load(f)
+    cfg_freesdg = bool(model_cfg.get('freesdg', False))
+    if args.freesdg_test_input is not None:
+        freesdg_test_input = args.freesdg_test_input
+    elif model_cfg.get('freesdg_test_input') is not None:
+        freesdg_test_input = model_cfg['freesdg_test_input']
+    else:
+        freesdg_test_input = 'raw'
+    use_freesdg_anchor = cfg_freesdg and freesdg_test_input == 'anchor'
+    if freesdg_test_input == 'anchor' and not cfg_freesdg:
+        print('* WARNING: --freesdg_test_input anchor requested, but the model '
+              'config has no active FreeSDG fields (freesdg=false or absent); '
+              'anchor preprocessing is skipped and raw input is used (plan §29.2).')
+
     model_name = 'wnet'
     model_path = args.model_path
     im_path = args.im_path
@@ -195,6 +225,27 @@ if __name__ == '__main__':
     tr = p_tr.Compose([rsz, tnsr])
     im_tens = tr(img)  # only transform image
 
+    if use_freesdg_anchor:
+        # Anchor flow (plan §13/§15): existing FOV, crop consistent with the
+        # image, NEAREST resize, fixed-anchor HFC (float, no uint8 round-trip),
+        # then the existing W-Net/TTA path.
+        from utils.freesdg_aug import FreeSDGAugmentor
+        from torchvision.transforms import functional as tvF
+        from torchvision.transforms import InterpolationMode
+        print('* Using FreeSDG anchor eval input (w={}, sigma={}, ratio={})'.format(
+            model_cfg.get('freesdg_anchor_w', 27),
+            model_cfg.get('freesdg_anchor_sigma', 9),
+            model_cfg.get('freesdg_ratio', 4.0)))
+        anchoror = FreeSDGAugmentor(
+            ratio=model_cfg.get('freesdg_ratio', 4.0),
+            anchor_w=model_cfg.get('freesdg_anchor_w', 27),
+            anchor_sigma=model_cfg.get('freesdg_anchor_sigma', 9))
+        minr, minc, maxr, maxc = coords_crop
+        mask_crop = mask[minr:maxr, minc:maxc]
+        mask_pil = Image.fromarray((mask_crop.astype(np.uint8)) * 255, mode='L')
+        mask_rsz = tvF.resize(mask_pil, tuple(im_tens.shape[-2:]), InterpolationMode.NEAREST)
+        im_tens = anchoror.anchor(im_tens, tvF.to_tensor(mask_rsz))
+
     print('* Instantiating model  = ' + str(model_name))
     model = get_arch(model_name).to(device)
     if model_name == 'wnet': model.mode='eval'
@@ -205,7 +256,7 @@ if __name__ == '__main__':
 
     print('* Saving prediction to ' + im_path_out)
     start_time = time.perf_counter()
-    full_pred, full_pred_bin = create_pred(model, im_tens, mask, coords_crop, original_sz, bin_thresh=bin_thresh, tta=tta)
+    full_pred, full_pred_bin = create_pred(model, im_tens, mask, coords_crop, original_sz, bin_thresh=bin_thresh, tta=tta, device=device)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         imsave(im_path_out, img_as_ubyte(full_pred))
