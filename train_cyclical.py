@@ -1,4 +1,5 @@
 import sys, json, os, argparse
+import contextlib
 from shutil import copyfile, rmtree
 import os.path as osp
 from datetime import datetime
@@ -14,6 +15,22 @@ from utils.model_saving_loading import save_model, str2bool, load_model
 from utils.reproducibility import set_seeds
 
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
+
+def _autocast(enabled):
+    if not enabled:
+        return contextlib.nullcontext()
+    if hasattr(torch, 'autocast'):
+        return torch.autocast(device_type='cuda', enabled=True)
+    return torch.cuda.amp.autocast(enabled=True)
+
+
+def _make_scaler():
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+        return torch.amp.GradScaler('cuda')
+    if hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'GradScaler'):
+        return torch.cuda.amp.GradScaler()
+    return None
 
 # argument parsing
 parser = argparse.ArgumentParser()
@@ -41,6 +58,7 @@ parser.add_argument('--path_test_preds', type=str, default=None, help='path to t
 parser.add_argument('--checkpoint_folder', type=str, default=None, help='path to model to start training (with pseudo labels now)')
 parser.add_argument('--num_workers', type=int, default=0, help='number of parallel (multiprocessing) workers to launch for data loading tasks (handled by pytorch) [default: %(default)s]')
 parser.add_argument('--device', type=str, default='cpu', help='where to run the training code (e.g. "cpu" or "cuda:0") [default: %(default)s]')
+parser.add_argument('--amp', type=str2bool, nargs='?', const=True, default=False, help='use automatic mixed precision (float16 autocast + grad scaling, CUDA only)')
 parser.add_argument('--seed', type=int, default=0, help='seed')
 
 
@@ -74,8 +92,9 @@ def get_lr(optimizer):
         return param_group['lr']
 
 def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
-        grad_acc_steps=0, assess=False):
+        grad_acc_steps=0, assess=False, scaler=None):
     device='cuda' if next(model.parameters()).is_cuda else 'cpu'
+    use_amp = scaler is not None and device == 'cuda'
     train = optimizer is not None  # if we are in training mode there will be an optimizer and train=True here
 
     # if train:
@@ -91,20 +110,21 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
 
     for i_batch, (inputs, labels) in enumerate(loader):
         inputs, labels = inputs.to(device), labels.to(device)
-        logits = model(inputs)
-        if isinstance(logits, tuple): # wnet
-            logits_aux, logits = logits
-            if model.n_classes == 1: # BCEWithLogitsLoss()/DiceLoss()
-                loss_aux = criterion(logits_aux, labels.unsqueeze(dim=1).float())
-                loss = loss_aux + criterion(logits, labels.unsqueeze(dim=1).float())
-            else: # CrossEntropyLoss()
-                loss_aux = criterion(logits_aux, labels)
-                loss = loss_aux + criterion(logits, labels)
-        else: # not wnet
-            if model.n_classes == 1:
-                loss = criterion(logits, labels.unsqueeze(dim=1).float())  # BCEWithLogitsLoss()/DiceLoss()
-            else:
-                loss = criterion(logits, labels)  # CrossEntropyLoss()
+        with _autocast(use_amp):
+            logits = model(inputs)
+            if isinstance(logits, tuple): # wnet
+                logits_aux, logits = logits
+                if model.n_classes == 1: # BCEWithLogitsLoss()/DiceLoss()
+                    loss_aux = criterion(logits_aux, labels.unsqueeze(dim=1).float())
+                    loss = loss_aux + criterion(logits, labels.unsqueeze(dim=1).float())
+                else: # CrossEntropyLoss()
+                    loss_aux = criterion(logits_aux, labels)
+                    loss = loss_aux + criterion(logits, labels)
+            else: # not wnet
+                if model.n_classes == 1:
+                    loss = criterion(logits, labels.unsqueeze(dim=1).float())  # BCEWithLogitsLoss()/DiceLoss()
+                else:
+                    loss = criterion(logits, labels)  # CrossEntropyLoss()
 
         # if train:  # only in training mode
         #     optimizer.zero_grad()
@@ -113,15 +133,22 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
         #     scheduler.step()
 
         if train:  # only in training mode
-            (loss / (grad_acc_steps + 1)).backward() # for grad_acc_steps=0, this is just loss
+            if use_amp:
+                scaler.scale(loss / (grad_acc_steps + 1)).backward()  # scaled grads also for grad_acc_steps=0
+            else:
+                (loss / (grad_acc_steps + 1)).backward() # for grad_acc_steps=0, this is just loss
             tr_lr = get_lr(optimizer)
             if i_batch % (grad_acc_steps+1) == 0:  # for grad_acc_steps=0, this is always True
-                optimizer.step()
+                if use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 for _ in range(grad_acc_steps+1):
                     scheduler.step() # for grad_acc_steps=0, this means once
                 optimizer.zero_grad()
         if assess:
-            logits_all.extend(logits)
+            logits_all.extend(logits.float())
             labels_all.extend(labels)
 
         # Compute running loss
@@ -132,7 +159,7 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
     if assess: return logits_all, labels_all, run_loss, tr_lr
     return None, None, run_loss, tr_lr
 
-def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0, cycle=0):
+def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0, cycle=0, scaler=None):
 
     model.train()
     optimizer.zero_grad()
@@ -143,12 +170,12 @@ def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=No
             if epoch == cycle_len-1: assess=True # only get logits/labels on last cycle
             else: assess = False
             tr_logits, tr_labels, tr_loss, tr_lr = run_one_epoch(train_loader, model, criterion, optimizer=optimizer,
-                                                          scheduler=scheduler, grad_acc_steps=grad_acc_steps, assess=assess)
+                                                          scheduler=scheduler, grad_acc_steps=grad_acc_steps, assess=assess, scaler=scaler)
             t.set_postfix(tr_loss_lr="{:.4f}/{:.6f}".format(float(tr_loss), tr_lr))
 
     return tr_logits, tr_labels, tr_loss
 
-def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, exp_path):
+def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, exp_path, scaler=None):
 
     n_cycles = len(scheduler.cycle_lens)
     best_auc, best_dice, best_cycle = 0, 0, 0
@@ -157,7 +184,7 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
     for cycle in range(n_cycles):
         print('Cycle {:d}/{:d}'.format(cycle+1, n_cycles))
         # train one cycle, retrieve segmentation data and compute metrics at the end of cycle
-        tr_logits, tr_labels, tr_loss = train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle)
+        tr_logits, tr_labels, tr_loss = train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle, scaler=scaler)
 
         # classification metrics at the end of cycle
         print(25 * '-' + '  End of cycle, evaluating ' + 25 * '-')
@@ -165,7 +192,7 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
         del tr_logits, tr_labels
         with torch.no_grad():
             assess=True
-            vl_logits, vl_labels, vl_loss, _ = run_one_epoch(val_loader, model, criterion, assess=assess)
+            vl_logits, vl_labels, vl_loss, _ = run_one_epoch(val_loader, model, criterion, assess=assess, scaler=scaler)
             vl_auc, vl_dice = evaluate(vl_logits, vl_labels, model.n_classes)  # for n_classes>1, will need to redo evaluate
             del vl_logits, vl_labels
         print('Train/Val Loss: {:.4f}/{:.4f}  -- Train/Val AUC: {:.4f}/{:.4f}  -- Train/Val DICE: {:.4f}/{:.4f} -- LR={:.6f}'.format(
@@ -275,6 +302,17 @@ if __name__ == '__main__':
     print("Total params: {0:,}".format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
     optimizer = torch.optim.Adam(model.parameters(), lr=max_lr)
 
+    scaler = None
+    if args.amp:
+        if device.type == 'cuda':
+            scaler = _make_scaler()
+            if scaler is None:
+                print('WARNING: --amp requested but not supported by this torch build; training in float32')
+            else:
+                print('* Training with automatic mixed precision (AMP)')
+        else:
+            print('WARNING: --amp is CUDA-only but device is {}; training in float32'.format(device.type))
+
     ### TRAINING WITH PSEUDO-LABELS
     csv_test = args.csv_test
     path_test_preds = args.path_test_preds
@@ -307,7 +345,7 @@ if __name__ == '__main__':
     print('* Starting to train\n','-' * 10)
 
 
-    m1, m2, m3=train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, experiment_path)
+    m1, m2, m3=train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, experiment_path, scaler=scaler)
 
     print("val_auc: %f" % m1)
     print("val_dice: %f" % m2)
