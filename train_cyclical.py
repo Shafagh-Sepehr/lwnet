@@ -1,4 +1,4 @@
-import sys, json, os, argparse
+import sys, json, os, argparse, math, time
 from shutil import copyfile, rmtree
 import os.path as osp
 from datetime import datetime
@@ -11,9 +11,11 @@ from models.get_model import get_arch
 from utils.get_loaders import get_train_val_loaders
 from utils.evaluation import evaluate, ewma
 from utils.model_saving_loading import save_model, str2bool, load_model
-from utils.reproducibility import set_seeds
+from utils.reproducibility import set_seeds, get_rng_states, set_rng_states
 
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from utils.schedulers import (DampedCosineLRSchedule, DampedCosineError,
+                              validate_damped_cosine_config)
 
 # argument parsing
 parser = argparse.ArgumentParser()
@@ -35,13 +37,24 @@ parser.add_argument('--do_not_save', type=str2bool, nargs='?', const=True, defau
 parser.add_argument('--save_path', type=str, default='date_time', help='path to save model (defaults to date/time')
 # these three are for training with pseudo-segmentations
 # e.g. --csv_test data/DRIVE/test.csv --path_test_preds results/DRIVE/experiments/wnet_drive
-# e.g. --csv_test data/LES_AV/test_all.csv --path_test_preds results/LES_AV/experiments/wnet_drive
+# e.g. --csv_test data/LES_AV/test_all.csv --path_test_preds results/DRIVE/experiments/wnet_drive
 parser.add_argument('--csv_test', type=str, default=None, help='path to test data csv (for using pseudo labels)')
 parser.add_argument('--path_test_preds', type=str, default=None, help='path to test predictions (for using pseudo labels)')
 parser.add_argument('--checkpoint_folder', type=str, default=None, help='path to model to start training (with pseudo labels now)')
 parser.add_argument('--num_workers', type=int, default=0, help='number of parallel (multiprocessing) workers to launch for data loading tasks (handled by pytorch) [default: %(default)s]')
 parser.add_argument('--device', type=str, default='cpu', help='where to run the training code (e.g. "cpu" or "cuda:0") [default: %(default)s]')
 parser.add_argument('--seed', type=int, default=0, help='seed')
+# learning-rate schedule selection
+parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'damped_cosine'],
+                    help="learning-rate schedule: 'cosine' (original CosineAnnealingLR behavior, default) "
+                         "or 'damped_cosine' (decaying full-cosine oscillation)")
+parser.add_argument('--dc_alpha', type=float, default=3.0, help='damped_cosine: nonnegative envelope decay strength')
+parser.add_argument('--dc_d', type=float, default=0.95, help='damped_cosine: oscillation depth in [0, 1]')
+parser.add_argument('--dc_period', type=int, default=0,
+                    help='damped_cosine: oscillation period in optimizer updates '
+                         '(0 = automatic: 2 x cycle_len x updates/epoch, matching the original scheduler oscillation)')
+parser.add_argument('--resume_from', type=str, default=None,
+                    help='path to a previous experiment folder whose training_state.pth should be resumed')
 
 
 def compare_op(metric):
@@ -73,8 +86,11 @@ def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
 
+def is_damped(scheduler):
+    return getattr(scheduler, 'kind', 'cosine') == 'damped_cosine'
+
 def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
-        grad_acc_steps=0, assess=False):
+        grad_acc_steps=0, assess=False, lr_log=None):
     device='cuda' if next(model.parameters()).is_cuda else 'cpu'
     train = optimizer is not None  # if we are in training mode there will be an optimizer and train=True here
 
@@ -116,9 +132,15 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
             (loss / (grad_acc_steps + 1)).backward() # for grad_acc_steps=0, this is just loss
             tr_lr = get_lr(optimizer)
             if i_batch % (grad_acc_steps+1) == 0:  # for grad_acc_steps=0, this is always True
+                if lr_log is not None:
+                    lr_log.append(float(tr_lr))  # lr actually used by this optimizer update
                 optimizer.step()
-                for _ in range(grad_acc_steps+1):
-                    scheduler.step() # for grad_acc_steps=0, this means once
+                if is_damped(scheduler):
+                    scheduler.step()  # exactly one scheduler step per optimizer update
+                else:
+                    # original behavior, preserved for the default scheduler
+                    for _ in range(grad_acc_steps+1):
+                        scheduler.step() # for grad_acc_steps=0, this means once
                 optimizer.zero_grad()
         if assess:
             logits_all.extend(logits)
@@ -132,7 +154,8 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
     if assess: return logits_all, labels_all, run_loss, tr_lr
     return None, None, run_loss, tr_lr
 
-def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0, cycle=0):
+def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0, cycle=0,
+                    lr_log=None, epoch_log=None, first_epoch=0):
 
     model.train()
     optimizer.zero_grad()
@@ -143,21 +166,60 @@ def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=No
             if epoch == cycle_len-1: assess=True # only get logits/labels on last cycle
             else: assess = False
             tr_logits, tr_labels, tr_loss, tr_lr = run_one_epoch(train_loader, model, criterion, optimizer=optimizer,
-                                                          scheduler=scheduler, grad_acc_steps=grad_acc_steps, assess=assess)
+                                                          scheduler=scheduler, grad_acc_steps=grad_acc_steps, assess=assess,
+                                                          lr_log=lr_log)
             t.set_postfix(tr_loss_lr="{:.4f}/{:.6f}".format(float(tr_loss), tr_lr))
+            if epoch_log is not None:
+                epoch_log.append({'cycle': cycle+1, 'epoch_in_cycle': epoch,
+                                  'global_epoch': first_epoch + epoch + 1,
+                                  'train_loss': float(tr_loss), 'lr': float(tr_lr)})
 
     return tr_logits, tr_labels, tr_loss
 
-def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, exp_path):
+def save_training_state(path, model, optimizer, scheduler, completed_cycles, completed_updates,
+                        total_planned_updates, best_state, lr_history, rng_states, loader_generator_state,
+                        elapsed_time):
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_type': getattr(scheduler, 'kind', 'cosine'),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'completed_cycles': completed_cycles,
+        'completed_updates': completed_updates,
+        'total_planned_updates': total_planned_updates,
+        'best_state': best_state,
+        'lr_history': lr_history,
+        'rng_states': rng_states,
+        'loader_generator_state': loader_generator_state,
+        'elapsed_time': elapsed_time,
+        }, osp.join(path, 'training_state.pth'))
+
+def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, exp_path,
+                start_cycle=0, best_state=None, lr_history=None, elapsed_time=0.0, resume_from=None):
 
     n_cycles = len(scheduler.cycle_lens)
-    best_auc, best_dice, best_cycle = 0, 0, 0
-    is_better, best_monitoring_metric = compare_op(metric)
+    if best_state is None:
+        best_state = {'best_auc': 0, 'best_dice': 0, 'best_cycle': 0, 'best_monitoring_metric': 0}
+    best_auc, best_dice, best_cycle = best_state['best_auc'], best_state['best_dice'], best_state['best_cycle']
+    best_monitoring_metric = best_state['best_monitoring_metric']
+    is_better, _ = compare_op(metric)
 
-    for cycle in range(n_cycles):
+    train_log = None
+    if exp_path is not None:
+        train_log = open(osp.join(exp_path, 'train_log.jsonl'), 'a')
+
+    train_time_start = time.time()
+
+    for cycle in range(start_cycle, n_cycles):
         print('Cycle {:d}/{:d}'.format(cycle+1, n_cycles))
         # train one cycle, retrieve segmentation data and compute metrics at the end of cycle
-        tr_logits, tr_labels, tr_loss = train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle)
+        first_epoch = sum(scheduler.cycle_lens[:cycle])
+        epoch_records = []
+        tr_logits, tr_labels, tr_loss = train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle,
+                                                        lr_log=lr_history, epoch_log=epoch_records, first_epoch=first_epoch)
+        if train_log is not None:
+            for rec in epoch_records:
+                train_log.write(json.dumps(dict(rec, type='epoch')) + '\n')
 
         # classification metrics at the end of cycle
         print(25 * '-' + '  End of cycle, evaluating ' + 25 * '-')
@@ -180,6 +242,7 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
             monitoring_metric = vl_loss
         elif metric == 'dice':
             monitoring_metric = vl_dice
+        checkpointed = False
         if is_better(monitoring_metric, best_monitoring_metric):
             print('Best {} attained. {:.2f} --> {:.2f}'.format(metric, 100*best_monitoring_metric, 100*monitoring_metric))
             best_auc, best_dice, best_cycle = vl_auc, vl_dice, cycle+1
@@ -187,6 +250,47 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
             if exp_path is not None:
                 print(25 * '-', ' Checkpointing ', 25 * '-')
                 save_model(exp_path, model, optimizer)
+                checkpointed = True
+
+        completed_updates = len(lr_history) if lr_history is not None else None
+        if train_log is not None:
+            train_log.write(json.dumps({'type': 'cycle_end', 'cycle': cycle+1,
+                                        'completed_updates': completed_updates,
+                                        'tr_loss': float(tr_loss), 'vl_loss': float(vl_loss),
+                                        'tr_auc': float(tr_auc), 'vl_auc': float(vl_auc),
+                                        'tr_dice': float(tr_dice), 'vl_dice': float(vl_dice),
+                                        'monitoring_metric': metric,
+                                        'monitoring_metric_value': float(monitoring_metric),
+                                        'checkpointed': checkpointed,
+                                        'lr_end_of_cycle': float(get_lr(optimizer))}) + '\n')
+            train_log.flush()
+        if exp_path is not None and lr_history is not None:
+            with open(osp.join(exp_path, 'lr_history.json'), 'w') as f:
+                json.dump(lr_history, f)
+        # full state for exact resumption (model, optimizer, schedule position, RNGs)
+        if exp_path is not None and lr_history is not None:
+            elapsed = elapsed_time + (time.time() - train_time_start)
+            generator_state = None
+            if getattr(train_loader, 'generator', None) is not None:
+                generator_state = train_loader.generator.get_state()
+            save_training_state(exp_path, model, optimizer, scheduler,
+                                completed_cycles=cycle+1, completed_updates=completed_updates,
+                                total_planned_updates=getattr(scheduler, 'total_updates', None),
+                                best_state={'best_auc': best_auc, 'best_dice': best_dice,
+                                            'best_cycle': best_cycle,
+                                            'best_monitoring_metric': best_monitoring_metric},
+                                lr_history=lr_history, rng_states=get_rng_states(),
+                                loader_generator_state=generator_state, elapsed_time=elapsed)
+
+    if train_log is not None:
+        train_log.close()
+    total_elapsed = elapsed_time + (time.time() - train_time_start)
+    if exp_path is not None and lr_history is not None:
+        with open(osp.join(exp_path, 'training_time.txt'), 'w') as f:
+            print('total_optimizer_updates: {}'.format(len(lr_history)), file=f)
+            print('planned_total_optimizer_updates: {}'.format(getattr(scheduler, 'total_updates', 'n/a')), file=f)
+            print('wall_time_seconds: {:.1f}'.format(total_elapsed), file=f)
+            print('resumed_from: {}'.format(resume_from), file=f)
 
     del model
     torch.cuda.empty_cache()
@@ -212,7 +316,7 @@ if __name__ == '__main__':
         device = torch.device(args.device)
 
     # reproducibility
-    seed_value = 0
+    seed_value = args.seed
     set_seeds(seed_value, args.device.startswith("cuda"))
 
     # gather parser parameters
@@ -259,14 +363,13 @@ if __name__ == '__main__':
 
 
     print("* Creating Dataloaders, batch size = {}, workers = {}".format(bs, args.num_workers))
-    train_loader, val_loader = get_train_val_loaders(csv_path_train=csv_train, csv_path_val=csv_val, batch_size=bs, tg_size=tg_size, label_values=label_values, num_workers=args.num_workers)
+    train_loader, val_loader = get_train_val_loaders(csv_path_train=csv_train, csv_path_val=csv_val, batch_size=bs, tg_size=tg_size, label_values=label_values, num_workers=args.num_workers, seed=seed_value)
 
     # grad_acc_steps: if I want to train with a fake_bs=K but the actual bs I want is bs=N, then you use
     # grad_acc_steps = N/K - 1.
     # Example: bs=4, fake_bs=4 -> grad_acc_steps = 0 (default)
     # Example: bs=4, fake_bs=2 -> grad_acc_steps = 1
     # Example: bs=4, fake_bs=1 -> grad_acc_steps = 3
-
 
     print('* Instantiating a {} model'.format(model_name))
     model = get_arch(model_name, in_c=args.in_c, n_classes=n_classes)
@@ -295,10 +398,75 @@ if __name__ == '__main__':
 
 
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=cycle_lens[0] * len(train_loader), eta_min=0)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cycle_lens[0] * len(train_loader), eta_min=0)
+    # number of optimizer updates per epoch: one update every (grad_acc_steps+1) batches
+    # (computed after the pseudo-label branch above, so an extended train set is accounted for)
+    updates_per_epoch = math.ceil(len(train_loader) / (grad_acc_steps + 1))
+    total_planned_updates = updates_per_epoch * sum(cycle_lens)
+
+    if args.scheduler == 'damped_cosine':
+        # original scheduler oscillation spans TWO cycles (decay over one cycle of
+        # T_max = cycle_lens[0]*len(train_loader) steps, rise over the next), so the
+        # matching damped-cosine period is 2*cycle_lens[0]*updates_per_epoch.
+        dc_period = args.dc_period if args.dc_period != 0 else 2 * cycle_lens[0] * updates_per_epoch
+        try:
+            validate_damped_cosine_config(total_planned_updates, dc_period, args.dc_alpha, args.dc_d,
+                                          max_lr, min_lr)
+        except DampedCosineError as e:
+            sys.exit('invalid damped_cosine configuration: {}'.format(e))
+        scheduler = DampedCosineLRSchedule(optimizer, total_updates=total_planned_updates,
+                                           period=dc_period, alpha=args.dc_alpha, d=args.dc_d,
+                                           lr_max=max_lr, lr_min=min_lr)
+    else:
+        # original scheduler, behavior preserved exactly (note: eta_min=0 regardless of --min_lr)
+        scheduler = CosineAnnealingLR(optimizer, T_max=cycle_lens[0] * len(train_loader), eta_min=0)
     setattr(optimizer, 'max_lr', max_lr)  # store it inside the optimizer for accessing to it later
     setattr(scheduler, 'cycle_lens', cycle_lens)
+    setattr(scheduler, 'kind', args.scheduler)
+    setattr(scheduler, 'total_updates', total_planned_updates)
 
+    print('* Scheduler: {} -- {} planned optimizer updates ({} per epoch x {} epochs)'.format(
+        args.scheduler, total_planned_updates, updates_per_epoch, sum(cycle_lens)))
+    if args.scheduler == 'damped_cosine':
+        print('  damped_cosine: alpha={}, d={}, period={} updates, lr_max={}, lr_min={}'.format(
+            args.dc_alpha, args.dc_d, dc_period, max_lr, min_lr))
+
+    # (re)save config including resolved schedule information
+    if do_not_save is False:
+        with open(config_file_path, 'w') as f:
+            cfg = dict(vars(args))
+            cfg['total_planned_updates'] = total_planned_updates
+            cfg['updates_per_epoch'] = updates_per_epoch
+            cfg['dc_period_resolved'] = dc_period if args.scheduler == 'damped_cosine' else None
+            json.dump(cfg, f, indent=2)
+
+    ### RESUMING A PREVIOUS RUN
+    start_cycle, best_state, lr_history, elapsed_time = 0, None, [], 0.0
+    if args.resume_from is not None:
+        state_path = osp.join(args.resume_from, 'training_state.pth')
+        if not osp.isfile(state_path):
+            sys.exit('cannot resume: {} not found (training_state.pth is saved at the end of each cycle)'.format(state_path))
+        state = torch.load(state_path, map_location=device, weights_only=False)
+        # consistency checks: never resume a run whose plan differs from the saved one
+        if state['scheduler_type'] != args.scheduler:
+            sys.exit('cannot resume: run was trained with scheduler "{}", but --scheduler {} was given'.format(
+                state['scheduler_type'], args.scheduler))
+        if state['total_planned_updates'] != total_planned_updates:
+            sys.exit('cannot resume: planned total optimizer updates changed (saved {}, now {})'.format(
+                state['total_planned_updates'], total_planned_updates))
+        model.load_state_dict(state['model_state_dict'])
+        optimizer.load_state_dict(state['optimizer_state_dict'])
+        # restores the schedule position without resetting decay or recomputing
+        # the horizon (DampedCosineLRSchedule.load_state_dict also restores T)
+        scheduler.load_state_dict(state['scheduler_state_dict'])
+        start_cycle = state['completed_cycles']
+        best_state = state['best_state']
+        lr_history = list(state['lr_history'])
+        elapsed_time = state.get('elapsed_time', 0.0)
+        set_rng_states(state['rng_states'])
+        if getattr(train_loader, 'generator', None) is not None and state.get('loader_generator_state') is not None:
+            train_loader.generator.set_state(state['loader_generator_state'])
+        print('* Resuming from {} at cycle {}/{} ({} optimizer updates done)'.format(
+            args.resume_from, start_cycle, len(cycle_lens), state['completed_updates']))
 
     criterion = torch.nn.BCEWithLogitsLoss() if model.n_classes == 1 else torch.nn.CrossEntropyLoss()
 
@@ -307,7 +475,9 @@ if __name__ == '__main__':
     print('* Starting to train\n','-' * 10)
 
 
-    m1, m2, m3=train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, experiment_path)
+    m1, m2, m3=train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, experiment_path,
+                           start_cycle=start_cycle, best_state=best_state, lr_history=lr_history,
+                           elapsed_time=elapsed_time, resume_from=args.resume_from)
 
     print("val_auc: %f" % m1)
     print("val_dice: %f" % m2)

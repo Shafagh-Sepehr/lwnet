@@ -9,6 +9,7 @@ from PIL import Image
 import numpy as np
 from skimage.measure import regionprops
 import torch
+from .reproducibility import seed_worker
 
 class TrainDataset(Dataset):
     def __init__(self, csv_path, transforms=None, label_values=None):
@@ -164,10 +165,21 @@ def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), lab
 
     return train_dataset, val_dataset
 
-def get_train_val_loaders(csv_path_train, csv_path_val, batch_size=4, tg_size=(512, 512), label_values=(0, 255), num_workers=0):
+def get_train_val_loaders(csv_path_train, csv_path_val, batch_size=4, tg_size=(512, 512), label_values=(0, 255), num_workers=0, seed=None):
     train_dataset, val_dataset = get_train_val_datasets(csv_path_train, csv_path_val, tg_size=tg_size, label_values=label_values)
 
-    train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available(), shuffle=True)
+    if seed is not None:
+        # Reproducible data order + augmentation: a dedicated generator makes
+        # shuffling independent of global RNG consumption, and worker_init_fn
+        # re-seeds each worker's RNGs deterministically every epoch.
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        worker_init_fn = seed_worker
+    else:
+        generator = None
+        worker_init_fn = None
+
+    train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available(), shuffle=True, generator=generator, worker_init_fn=worker_init_fn)
     val_loader = DataLoader(dataset=val_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
     return train_loader, val_loader
 
