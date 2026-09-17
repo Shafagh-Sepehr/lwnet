@@ -13,6 +13,8 @@ from utils.evaluation import evaluate, ewma
 from utils.model_saving_loading import save_model, str2bool, load_model
 from utils.reproducibility import set_seeds
 
+from segmentation_losses import build_segmentation_loss
+
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # argument parsing
@@ -55,6 +57,13 @@ parser.add_argument('--freesdg_seed', type=int, default=0, help='dedicated seed 
 # Diagnostic-stage selectors (defaults preserve existing behavior)
 parser.add_argument('--freesdg_aug_mode', type=str, default='fmaug', choices=['fmaug', 'fixed_hfc', 'random_hfc', 'raffe_filter', 'raffe_smooth_mix'], help='training augmentation mode: full FreeSDG FMAug, deterministic fixed anchor HFC, single random bank HFC view, official RaffeSDG random frequency filtering, or RaffeSDG smooth blending')
 parser.add_argument('--freesdg_lwnet_aug_profile', type=str, default='original', choices=['original', 'flips_only'], help='LwNet augmentation applied after the frequency transform: original pipeline or flips only (diagnostic)')
+# Composable segmentation losses (independent of FreeSDG/augmentation):
+# total = w_bce*bce + w_dice*dice + w_cldice*cldice + w_boundary*boundary
+parser.add_argument('--loss_bce_weight', type=float, default=1.0, help='weight of the BCE term (the existing baseline term)')
+parser.add_argument('--loss_dice_weight', type=float, default=0.0, help='weight of the foreground soft Dice term')
+parser.add_argument('--loss_cldice_weight', type=float, default=0.0, help='weight of the foreground soft-clDice topology term')
+parser.add_argument('--loss_boundary_weight', type=float, default=0.0, help='weight of the signed-distance boundary term (distances in pixels: resolution/scale dependent, pilot at 0.01)')
+parser.add_argument('--loss_cldice_iters', type=int, default=10, help='soft-skeleton erosion iterations for the clDice term')
 
 
 def compare_op(metric):
@@ -86,6 +95,19 @@ def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
 
+def format_loss_components(split, comps, criterion):
+    # One line of unweighted values, CLI weights, and weighted contributions;
+    # disabled terms are simply absent from comps.
+    weights = getattr(criterion, 'weights', {})
+    parts = []
+    for name, value in comps.items():
+        w = weights.get(name)
+        if w is None:
+            parts.append('{:s}={:.4f}'.format(name, value))
+        else:
+            parts.append('{:s}={:.4f} (w={:g} -> {:.4f})'.format(name, value, w, w * value))
+    return '{} loss components: {}'.format(split, ' | '.join(parts))
+
 def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
         grad_acc_steps=0, assess=False):
     device='cuda' if next(model.parameters()).is_cuda else 'cpu'
@@ -100,22 +122,35 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
 
     if assess: logits_all, labels_all = [], []
     n_elems, running_loss, tr_lr = 0, 0, 0
+    # Detached component sums kept as device tensors; they are transferred to
+    # Python floats once per epoch (no per-batch GPU synchronization).
+    comp_running = {}
 
-
-    for i_batch, (inputs, labels) in enumerate(loader):
+    for i_batch, batch in enumerate(loader):
+        inputs, labels = batch[0], batch[1]
+        # Optional distance maps collated with the labels (boundary loss only).
+        distance_maps = batch[2] if len(batch) > 2 else None
         inputs, labels = inputs.to(device), labels.to(device)
+        if distance_maps is not None:
+            distance_maps = distance_maps.to(device)
         logits = model(inputs)
+        components = None
         if isinstance(logits, tuple): # wnet
             logits_aux, logits = logits
-            if model.n_classes == 1: # BCEWithLogitsLoss()/DiceLoss()
-                loss_aux = criterion(logits_aux, labels.unsqueeze(dim=1).float())
-                loss = loss_aux + criterion(logits, labels.unsqueeze(dim=1).float())
+            if model.n_classes == 1: # SegmentationLoss (same criterion on each head)
+                tgt = labels.unsqueeze(dim=1).float()
+                loss_aux, comps_aux = criterion(logits_aux, tgt, distance_map=distance_maps)
+                loss, comps_main = criterion(logits, tgt, distance_map=distance_maps)
+                loss = loss_aux + loss
+                # aggregate reported components with the same (unit) head weights
+                # so their weighted sum matches the total
+                components = {k: comps_aux[k] + comps_main[k] for k in comps_main}
             else: # CrossEntropyLoss()
                 loss_aux = criterion(logits_aux, labels)
                 loss = loss_aux + criterion(logits, labels)
         else: # not wnet
             if model.n_classes == 1:
-                loss = criterion(logits, labels.unsqueeze(dim=1).float())  # BCEWithLogitsLoss()/DiceLoss()
+                loss, components = criterion(logits, labels.unsqueeze(dim=1).float(), distance_map=distance_maps)  # SegmentationLoss
             else:
                 loss = criterion(logits, labels)  # CrossEntropyLoss()
 
@@ -141,9 +176,16 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
         running_loss += loss.item() * inputs.size(0)
         n_elems += inputs.size(0)
         run_loss = running_loss / n_elems
+        if components is not None:
+            for k, v in components.items():
+                comp_running[k] = comp_running.get(k, 0.0) + v * inputs.size(0)
 
-    if assess: return logits_all, labels_all, run_loss, tr_lr
-    return None, None, run_loss, tr_lr
+    comp_means = None
+    if comp_running:
+        comp_means = {k: (v / n_elems).item() for k, v in comp_running.items()}
+
+    if assess: return logits_all, labels_all, run_loss, tr_lr, comp_means
+    return None, None, run_loss, tr_lr, comp_means
 
 def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0, cycle=0):
 
@@ -155,11 +197,11 @@ def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=No
         for epoch in t:
             if epoch == cycle_len-1: assess=True # only get logits/labels on last cycle
             else: assess = False
-            tr_logits, tr_labels, tr_loss, tr_lr = run_one_epoch(train_loader, model, criterion, optimizer=optimizer,
+            tr_logits, tr_labels, tr_loss, tr_lr, tr_comps = run_one_epoch(train_loader, model, criterion, optimizer=optimizer,
                                                           scheduler=scheduler, grad_acc_steps=grad_acc_steps, assess=assess)
             t.set_postfix(tr_loss_lr="{:.4f}/{:.6f}".format(float(tr_loss), tr_lr))
 
-    return tr_logits, tr_labels, tr_loss
+    return tr_logits, tr_labels, tr_loss, tr_comps
 
 def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, exp_path):
 
@@ -170,7 +212,7 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
     for cycle in range(n_cycles):
         print('Cycle {:d}/{:d}'.format(cycle+1, n_cycles))
         # train one cycle, retrieve segmentation data and compute metrics at the end of cycle
-        tr_logits, tr_labels, tr_loss = train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle)
+        tr_logits, tr_labels, tr_loss, tr_comps = train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle)
 
         # classification metrics at the end of cycle
         print(25 * '-' + '  End of cycle, evaluating ' + 25 * '-')
@@ -178,11 +220,17 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
         del tr_logits, tr_labels
         with torch.no_grad():
             assess=True
-            vl_logits, vl_labels, vl_loss, _ = run_one_epoch(val_loader, model, criterion, assess=assess)
+            vl_logits, vl_labels, vl_loss, _, vl_comps = run_one_epoch(val_loader, model, criterion, assess=assess)
             vl_auc, vl_dice = evaluate(vl_logits, vl_labels, model.n_classes)  # for n_classes>1, will need to redo evaluate
             del vl_logits, vl_labels
         print('Train/Val Loss: {:.4f}/{:.4f}  -- Train/Val AUC: {:.4f}/{:.4f}  -- Train/Val DICE: {:.4f}/{:.4f} -- LR={:.6f}'.format(
                 tr_loss, vl_loss, tr_auc, vl_auc, tr_dice, vl_dice, get_lr(optimizer)).rstrip('0'))
+        # Enabled unweighted loss components, their weighted contributions and
+        # total (total is the Train/Val Loss above). Note: validation total
+        # loss is objective-specific and cannot be compared numerically across
+        # different weight configurations as evidence of superiority.
+        if tr_comps: print(format_loss_components('Train', tr_comps, criterion))
+        if vl_comps: print(format_loss_components('Val', vl_comps, criterion))
 
         # check if performance was better than anyone before and checkpoint if so
         if metric == 'auc':
@@ -299,9 +347,28 @@ if __name__ == '__main__':
         n_classes=1
         label_values = [0, 255]
 
+    # Composable segmentation criterion, built once through the generic builder,
+    # outside all FreeSDG/Raffe conditionals: vanilla LwNet and every
+    # augmentation variant use exactly the same criterion. Validation runs once
+    # here so misconfiguration fails before anything is created.
+    if n_classes == 1:
+        try:
+            criterion = build_segmentation_loss(args)
+        except ValueError as e:
+            sys.exit('Invalid loss configuration: {}'.format(e))
+    else: # artery-vein segmentation keeps its original criterion untouched
+        criterion = torch.nn.CrossEntropyLoss()
+    # Generic boundary-loss requirement for the target-preparation path:
+    # derived only from loss_boundary_weight > 0 (never from --freesdg).
+    need_distance_map = bool(getattr(criterion, 'need_distance_map', False))
+
+    print('* Instantiating loss function', str(criterion))
+    if hasattr(criterion, 'formula'):
+        print('* Loss formula:', criterion.formula)
+
 
     print("* Creating Dataloaders, batch size = {}, workers = {}".format(bs, args.num_workers))
-    train_loader, val_loader = get_train_val_loaders(csv_path_train=csv_train, csv_path_val=csv_val, batch_size=bs, tg_size=tg_size, label_values=label_values, num_workers=args.num_workers, freesdg_cfg=freesdg_cfg)
+    train_loader, val_loader = get_train_val_loaders(csv_path_train=csv_train, csv_path_val=csv_val, batch_size=bs, tg_size=tg_size, label_values=label_values, num_workers=args.num_workers, freesdg_cfg=freesdg_cfg, need_distance_map=need_distance_map)
 
     # grad_acc_steps: if I want to train with a fake_bs=K but the actual bs I want is bs=N, then you use
     # grad_acc_steps = N/K - 1.
@@ -342,10 +409,6 @@ if __name__ == '__main__':
     setattr(scheduler, 'cycle_lens', cycle_lens)
 
 
-    criterion = torch.nn.BCEWithLogitsLoss() if model.n_classes == 1 else torch.nn.CrossEntropyLoss()
-
-
-    print('* Instantiating loss function', str(criterion))
     print('* Starting to train\n','-' * 10)
 
 

@@ -14,14 +14,25 @@ from torchvision.transforms import InterpolationMode
 
 from .freesdg_aug import FreeSDGAugmentor
 
+# Root-level loss module (scripts run from the repo root; torch-only import,
+# SciPy stays lazy inside signed_distance_map for boundary preparation).
+from segmentation_losses import signed_distance_map, check_binary_labels
+
 class TrainDataset(Dataset):
-    def __init__(self, csv_path, transforms=None, label_values=None, freesdg_cfg=None):
+    def __init__(self, csv_path, transforms=None, label_values=None, freesdg_cfg=None,
+                 need_distance_map=False):
         df = pd.read_csv(csv_path)
         self.im_list = df.im_paths
         self.gt_list = df.gt_paths
         self.mask_list = df.mask_paths
         self.transforms = transforms
         self.label_values = label_values  # for use in label_encoding
+        # Generic supervision metadata for the signed-distance boundary loss:
+        # when True, each sample additionally returns a distance map computed
+        # on CPU from the FINAL label (after resize/crop/rotation/deformation,
+        # at the supervised output resolution). Derived only from
+        # loss_boundary_weight > 0; never from --freesdg.
+        self.need_distance_map = need_distance_map
         # Opt-in FreeSDG FMAug configuration (plan §10). None/disabled ->
         # the original code path below executes verbatim.
         self.freesdg_cfg = freesdg_cfg
@@ -121,6 +132,17 @@ class TrainDataset(Dataset):
             if torch.max(target) >1:
                 target= target.float()/255
 
+        # Optional boundary-loss supervision metadata: the signed-distance map
+        # is recomputed from the final (post-augmentation) label here on CPU
+        # -- no original-size/stale map is cached or deformed alongside -- then
+        # collated and transferred to the device together with the labels.
+        # The existing two-tensor sample format is preserved when disabled.
+        # Degenerate masks (all-background/all-foreground) yield a zero map.
+        if self.need_distance_map:
+            check_binary_labels(target)
+            dist_map = signed_distance_map(target.unsqueeze(0))  # [1, H, W]
+            return img, target, dist_map
+
         return img, target
 
     def __len__(self):
@@ -201,17 +223,17 @@ def build_pseudo_dataset(train_csv_path, test_csv_path, path_to_preds):
     return train_im_list, train_gt_list, train_mask_list
 
 
-def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), label_values=(0, 255), freesdg_cfg=None):
+def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), label_values=(0, 255), freesdg_cfg=None, need_distance_map=False):
 
     freesdg_enabled = freesdg_cfg is not None and freesdg_cfg.get('enabled', False)
     if freesdg_enabled:
         train_freesdg_cfg = dict(freesdg_cfg, role='train')
         val_freesdg_cfg = dict(freesdg_cfg, role='val')
-        train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values, freesdg_cfg=train_freesdg_cfg)
-        val_dataset = TrainDataset(csv_path=csv_path_val, label_values=label_values, freesdg_cfg=val_freesdg_cfg)
+        train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values, freesdg_cfg=train_freesdg_cfg, need_distance_map=need_distance_map)
+        val_dataset = TrainDataset(csv_path=csv_path_val, label_values=label_values, freesdg_cfg=val_freesdg_cfg, need_distance_map=need_distance_map)
     else:
-        train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values)
-        val_dataset = TrainDataset(csv_path=csv_path_val, label_values=label_values)
+        train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values, need_distance_map=need_distance_map)
+        val_dataset = TrainDataset(csv_path=csv_path_val, label_values=label_values, need_distance_map=need_distance_map)
     # transforms definition
     # required transforms
     resize = p_tr.Resize(tg_size)
@@ -248,8 +270,10 @@ def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), lab
 
     return train_dataset, val_dataset
 
-def get_train_val_loaders(csv_path_train, csv_path_val, batch_size=4, tg_size=(512, 512), label_values=(0, 255), num_workers=0, freesdg_cfg=None):
-    train_dataset, val_dataset = get_train_val_datasets(csv_path_train, csv_path_val, tg_size=tg_size, label_values=label_values, freesdg_cfg=freesdg_cfg)
+def get_train_val_loaders(csv_path_train, csv_path_val, batch_size=4, tg_size=(512, 512), label_values=(0, 255), num_workers=0, freesdg_cfg=None, need_distance_map=False):
+    # need_distance_map is the generic boundary-loss requirement; it is applied
+    # to the validation loader as well because validation loss is calculated.
+    train_dataset, val_dataset = get_train_val_datasets(csv_path_train, csv_path_val, tg_size=tg_size, label_values=label_values, freesdg_cfg=freesdg_cfg, need_distance_map=need_distance_map)
 
     train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available(), shuffle=True)
     val_loader = DataLoader(dataset=val_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
