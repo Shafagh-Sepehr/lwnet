@@ -52,6 +52,9 @@ parser.add_argument('--freesdg_ratio', type=float, default=4.0, help='HFC residu
 parser.add_argument('--freesdg_mixup_size', type=int, default=-1, help='FMAug rectangle size: -1 random (repo policy) or >0 fixed square; 0 is invalid')
 parser.add_argument('--freesdg_mix_policy', type=str, default='repo', choices=['repo', 'paper'], help='FMAug rectangle sampling policy')
 parser.add_argument('--freesdg_seed', type=int, default=0, help='dedicated seed for the isolated FMAug RNG stream')
+# Diagnostic-stage selectors (defaults preserve existing behavior)
+parser.add_argument('--freesdg_aug_mode', type=str, default='fmaug', choices=['fmaug', 'fixed_hfc', 'random_hfc', 'raffe_filter', 'raffe_smooth_mix'], help='training augmentation mode: full FreeSDG FMAug, deterministic fixed anchor HFC, single random bank HFC view, official RaffeSDG random frequency filtering, or RaffeSDG smooth blending')
+parser.add_argument('--freesdg_lwnet_aug_profile', type=str, default='original', choices=['original', 'flips_only'], help='LwNet augmentation applied after the frequency transform: original pipeline or flips only (diagnostic)')
 
 
 def compare_op(metric):
@@ -233,6 +236,8 @@ if __name__ == '__main__':
             'mixup_size': args.freesdg_mixup_size,
             'mix_policy': args.freesdg_mix_policy,
             'seed': args.freesdg_seed,
+            'aug_mode': args.freesdg_aug_mode,
+            'lwnet_aug_profile': args.freesdg_lwnet_aug_profile,
         }
     else:
         freesdg_cfg = None

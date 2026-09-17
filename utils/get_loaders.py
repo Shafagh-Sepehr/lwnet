@@ -27,22 +27,28 @@ class TrainDataset(Dataset):
         self.freesdg_cfg = freesdg_cfg
         self.freesdg_resize = None  # hoisted deterministic resize (set by get_train_val_datasets)
         self._freesdg_augmentor = None
+        self._freesdg_augmentor_args = None
         self._freesdg_mask_resize = None
 
     def _freesdg_enabled(self):
         return self.freesdg_cfg is not None and self.freesdg_cfg.get('enabled', False)
 
     def _get_freesdg_augmentor(self):
-        if self._freesdg_augmentor is None:
-            cfg = self.freesdg_cfg
+        args = (
+            self.freesdg_cfg.get('seed', 0),
+            self.freesdg_cfg.get('ratio', 4.0),
+            self.freesdg_cfg.get('mixup_size', -1),
+            self.freesdg_cfg.get('mix_policy', 'repo'),
+            self.freesdg_cfg.get('anchor_w', 27),
+            self.freesdg_cfg.get('anchor_sigma', 9),
+            self.freesdg_cfg.get('aug_mode', 'fmaug'),
+        )
+        if self._freesdg_augmentor is None or self._freesdg_augmentor_args != args:
+            self._freesdg_augmentor_args = args
             self._freesdg_augmentor = FreeSDGAugmentor(
-                seed=cfg.get('seed', 0),
-                ratio=cfg.get('ratio', 4.0),
-                mixup_size=cfg.get('mixup_size', -1),
-                mix_policy=cfg.get('mix_policy', 'repo'),
-                anchor_w=cfg.get('anchor_w', 27),
-                anchor_sigma=cfg.get('anchor_sigma', 9),
-            )
+                seed=args[0], ratio=args[1], mixup_size=args[2],
+                mix_policy=args[3], anchor_w=args[4], anchor_sigma=args[5],
+                aug_mode=args[6])
         return self._freesdg_augmentor
 
     def _freesdg_mask_tensor(self, mask, hw):
@@ -225,7 +231,14 @@ def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), lab
         # The deterministic resize is hoisted ahead of FMAug in
         # TrainDataset.__getitem__ (same resize instance/interpolations);
         # the remaining original transform order is kept verbatim (§10.1).
-        train_transforms = p_tr.Compose([scale_transl_rot, jitter, h_flip, v_flip, tensorizer])
+        # Diagnostic profile (plan M4): 'flips_only' disables LwNet's
+        # scale/translation/rotation and ColorJitter after FMAug, keeping
+        # only the flips + tensor conversion. The vanilla baseline
+        # transforms are never altered.
+        if freesdg_cfg.get('lwnet_aug_profile', 'original') == 'flips_only':
+            train_transforms = p_tr.Compose([h_flip, v_flip, tensorizer])
+        else:
+            train_transforms = p_tr.Compose([scale_transl_rot, jitter, h_flip, v_flip, tensorizer])
         train_dataset.freesdg_resize = resize
     else:
         train_transforms = p_tr.Compose([resize,  scale_transl_rot, jitter, h_flip, v_flip, tensorizer])

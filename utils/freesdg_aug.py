@@ -41,8 +41,10 @@ docs/freesdg_deviations.md; plan §19):
               validated under the repository default ``num_workers=0``.
 """
 
+import math
 import random
 
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -53,6 +55,179 @@ import torch.nn.functional as F
 FREESDG_FILTER_BANK = tuple(zip(range(5, 50, 2), range(2, 22)))
 
 MIX_POLICIES = ("repo", "paper")
+
+AUG_MODES = ("fmaug", "fixed_hfc", "random_hfc", "raffe_filter",
+             "raffe_smooth_mix")
+
+# --- Official RaffeSDG random-frequency-filtering constants ---------------
+# Transcribed from the official repository (Non-IID_Medical_Image_Segmentation,
+# utils/augmentations/fmaug.py, hfc_type='butterworth_per_channel'):
+RAFFE_D0_NUM = 12        # d0_num
+RAFFE_D0_MAX = 0.1       # d0_max
+RAFFE_REMAP_RATIO = 4.1  # remap_ratio
+RAFFE_N_LIST = (1, 2, 3)  # n_list
+RAFFE_PCTL = 3           # normalization_percentile_threshold
+# Test-time filter of the official RaffeSDG model (raffesdg_segmentation_model):
+RAFFE_TEST_D0_RATIO = 0.005
+RAFFE_TEST_N = 1
+
+
+def raffe_d0_list():
+    """Official d0_list: exponential remap of linspace(0, d0_max, 12)."""
+    lin = [i / (RAFFE_D0_NUM - 1) for i in range(RAFFE_D0_NUM)]
+    return [RAFFE_D0_MAX * (math.exp(RAFFE_REMAP_RATIO * l) - 1) /
+            (math.exp(RAFFE_REMAP_RATIO) - 1) for l in lin]
+
+
+def build_corner_butterworth_map(height, width, d0_ratio, n,
+                                 dtype=torch.float32):
+    """Official FourierButterworthHFCFilter.filter_map (vectorized).
+
+    Semantics transcribed literally from the reference implementation,
+    including its index transposition (``filter_map[j, i]``):
+
+        d0 = int(max((d0_ratio * min(H, W)) // 2, 1))
+        for i in rows, j in cols:
+            d = min euclidean distance of (i, j) to the four image corners
+            map[j, i] = 1 / (1 + (d0 / (d + 1)) ** (2 * n))
+
+    With no fftshift, torch.fft.fft2 keeps low frequencies at the spectrum
+    corners, so this map is a corner-centered Butterworth high-pass. The
+    double loop is vectorized for speed; results are numerically identical
+    (verified against the literal loop in test_freesdg_smoke.py).
+    """
+    d0 = int(max((d0_ratio * min(height, width)) // 2, 1))
+    if height != width:
+        # the reference implementation's transposed assignment
+        # (filter_map[j, i]) overflows for non-square sizes — square input
+        # is the only officially defined case (it uses 512x512)
+        raise ValueError(
+            "FourierButterworth corner map requires square input, "
+            "got {}x{}".format(height, width))
+    rows = torch.arange(height, dtype=torch.float64)
+    cols = torch.arange(width, dtype=torch.float64)
+    corners = ((0.0, 0.0), (0.0, float(width - 1)),
+               (float(height - 1), float(width - 1)), (float(height - 1), 0.0))
+    dist = None
+    for (cx, cy) in corners:
+        # reference: sqrt((i - x)^2 + (j - y)^2) for row i, col j
+        d = (rows - cx).unsqueeze(1) ** 2 + (cols - cy).unsqueeze(0) ** 2
+        d = d.sqrt()
+        dist = d if dist is None else torch.minimum(dist, d)
+    fmap = 1.0 / (1.0 + (d0 / (dist + 1.0)) ** (2 * n))
+    return fmap.t().to(dtype)  # reference assigns filter_map[j, i]
+
+
+class FourierButterworthView:
+    """One official FourierButterworthHFCFilter, operating in [0,1].
+
+    Faithful port of the official train/test behavior used by RaffeSDG
+    (do_median_padding=False):  fft2 -> corner-map multiply -> abs(ifft2) ->
+    per-sample/per-channel [3rd, 97th] percentile normalization (percentiles
+    computed on the 1/256-quantized copy, applied to the unquantized tensor,
+    exactly as the reference) -> FOV masking (res * mask).
+
+    Deviation from the official pipeline (documented): the official network
+    consumed unclamped values after a [0,1]->[-1,1] remap; LwNet requires
+    [0,1] inputs, so the normalized output is clipped to [0,1] here
+    (percentiles are still computed on the unclamped plane, exactly like
+    the reference). Background (mask == 0) is 0, consistent with the
+    reference's res * mask.
+    """
+
+    def __init__(self, height, width, d0_ratio, n):
+        self.d0_ratio = float(d0_ratio)
+        self.n = int(n)
+        self.fmap = build_corner_butterworth_map(height, width, self.d0_ratio,
+                                                 self.n)
+
+    def __call__(self, x01, mask01):
+        if x01.dim() != 4:
+            raise ValueError("x01 must be [B, C, H, W] in [0,1]")
+        fmap = self.fmap.to(device=x01.device, dtype=x01.dtype)
+        spec = torch.fft.fft2(x01) * fmap
+        res = torch.abs(torch.fft.ifft2(spec))  # >= 0 by construction
+        # official percentile normalization, per sample and channel
+        out = torch.empty_like(res)
+        for b in range(res.shape[0]):
+            for c in range(res.shape[1]):
+                plane = res[b, c].detach().cpu().numpy()
+                # reference temp: (res*256).int().float()/256 (truncating cast)
+                temp = np.trunc(plane * 256) / 256.0
+                lo = float(np.percentile(temp, RAFFE_PCTL))
+                hi = float(np.percentile(temp, 100 - RAFFE_PCTL))
+                denom = hi - lo if hi > lo else 1e-8
+                out[b, c] = torch.from_numpy(
+                    ((plane - lo) / denom).clip(0.0, 1.0))
+        return out * mask01.to(dtype=out.dtype)
+
+
+class RaffeFilterBank:
+    """Official 36-filter bank: 12 remapped d0 ratios x n in {1,2,3}.
+
+    Bank index i (official loop): d0_ratio = d0_list[i // 3], n = n_list[i % 3].
+    Views are built lazily per spatial size (official uses fixed 512x512).
+    """
+
+    def __init__(self):
+        d0s = raffe_d0_list()
+        self.params = [(d0s[i // 3], RAFFE_N_LIST[i % 3])
+                       for i in range(len(RAFFE_N_LIST) * RAFFE_D0_NUM)]
+        self._views = {}  # (H, W) -> list of FourierButterworthView
+
+    def views(self, height, width):
+        key = (height, width)
+        if key not in self._views:
+            self._views[key] = [FourierButterworthView(height, width, d0, n)
+                                for d0, n in self.params]
+        return self._views[key]
+
+    def sample_indices(self, rng, channels=3):
+        """Official per-channel independent choice (butterworth_per_channel)."""
+        return [rng.randrange(0, len(self.params)) for _ in range(channels)]
+
+    def apply(self, x01, mask01, indices):
+        views = self.views(x01.shape[-2], x01.shape[-1])
+        return torch.cat([views[indices[c]](x01[:, c:c + 1], mask01)
+                          for c in range(x01.shape[1])], dim=1)
+
+
+class DT2SmoothMask:
+    """Official DT2MASKGenerator (utils/mixup_mask.py), verbatim port.
+
+    The official 'smooth' blending masks are OFFLINE files not distributed
+    with the repository (OfflineMaskGenerator reads them from
+    /data/lihaojin/random_mask), so the official in-repo continuous
+    generator DT2MASKGenerator is used instead: 5 random seed points,
+    100 steps of MaxPool2d(5, 1, 2) expansion accumulated with weight 1/100,
+    then min-max normalized (MaskGenerator.generate_mask). Draw order per
+    mask: 5 centers, each randint(0, size-1) (official hardcodes 511 for
+    512; generalized to the actual size here — documented adaptation).
+    All randomness comes from the CALLER's dedicated RNG.
+    """
+
+    def __init__(self, center_num=5, expansion_step=100):
+        self.center_num = center_num
+        self.expansion_step = expansion_step
+        self.max_pool = nn.MaxPool2d(kernel_size=5, stride=1, padding=2)
+
+    def generate(self, rng, height, width):
+        pts = [(rng.randint(0, height - 1), rng.randint(0, width - 1))
+               for _ in range(self.center_num)]
+        seeds = torch.zeros(1, height, width)
+        for (r, c) in pts:
+            seeds[0, r, c] = 1.0
+        acc = torch.zeros(1, height, width)
+        step = 1.0 / self.expansion_step
+        for _ in range(self.expansion_step):
+            seeds = self.max_pool(seeds)
+            acc += step * seeds
+        m = acc.squeeze(0)
+        # official generate_mask(): min-max normalize
+        lo, hi = m.min(), m.max()
+        if float(hi - lo) <= 0.0:
+            return torch.zeros_like(m)
+        return (m - lo) / (hi - lo)
 
 
 def build_gaussian_kernel2d(k_sz, sigma, dtype=torch.float32, device=None):
@@ -323,14 +498,21 @@ class FreeSDGAugmentor:
     """
 
     def __init__(self, seed=0, ratio=4.0, mixup_size=-1, mix_policy="repo",
-                 anchor_w=27, anchor_sigma=9):
+                 anchor_w=27, anchor_sigma=9, aug_mode="fmaug"):
+        if aug_mode not in AUG_MODES:
+            raise ValueError(
+                "aug_mode must be one of {}, got {!r}".format(
+                    AUG_MODES, aug_mode))
         self.seed = int(seed)
+        self.aug_mode = aug_mode
         self.mixup = GaussianMixUp(
             ratio=ratio, mixup_size=mixup_size, mix_policy=mix_policy
         )
         self.anchor_filter = HFCFilter(
             int(anchor_w), float(anchor_sigma), ratio=float(ratio)
         )
+        self.raffe_bank = RaffeFilterBank()
+        self.raffe_smooth = DT2SmoothMask()
         self._rng = None
 
     @property
@@ -363,16 +545,64 @@ class FreeSDGAugmentor:
             m = m.expand(x.shape[0], -1, -1, -1)
         return x, m, squeeze
 
-    def augment_train(self, img01, mask01, raw_prob=0.0):
-        """Training-time FMAug with raw exposure (plan §9, families B/D)."""
+    def augment_train(self, img01, mask01, raw_prob=0.0, filter_idx=None,
+                      raffe_indices_1=None, raffe_indices_2=None,
+                      blend_mask=None):
+        """Training-time augmentation with the configured aug_mode.
+
+        Draw order (dedicated RNG, uniform across modes): raw/FMAug coin
+        first, then the mode's own draws:
+          * fmaug:          filter i, filter j, rectangle   (plan §9)
+          * fixed_hfc:      none (deterministic anchor filter)
+          * random_hfc:     single Gaussian-bank filter index
+          * raffe_filter:   per-channel bank indices (ch0, ch1, ch2)
+          * raffe_smooth_mix: view-1 per-channel indices, view-2 per-channel
+            indices, then 5 DT2 blend-mask centers
+
+        The optional hook arguments are deterministic test hooks only
+        (filter_idx for random_hfc, raffe_indices_*/blend_mask for the
+        raffe modes); production code never passes them.
+        """
         with torch.no_grad():
             # Raw/FMAug probability comes from the dedicated RNG (§6.2).
             if self.rng.random() < raw_prob:
                 return img01
             x, m, squeeze = self._as_batch(img01, mask01)
-            x_pm1 = 2.0 * x - 1.0
-            y_pm1 = self.mixup(x_pm1, m.to(dtype=x_pm1.dtype), rng=self.rng)
-            y01 = (y_pm1 + 1.0) / 2.0
+            m = m.to(dtype=x.dtype)
+            if self.aug_mode == "fmaug":
+                x_pm1 = 2.0 * x - 1.0
+                y = self.mixup(x_pm1, m, rng=self.rng)
+                y01 = (y + 1.0) / 2.0
+            elif self.aug_mode == "fixed_hfc":
+                x_pm1 = 2.0 * x - 1.0
+                y01 = (self.anchor_filter(x_pm1, m) + 1.0) / 2.0
+            elif self.aug_mode == "random_hfc":
+                if filter_idx is None:
+                    filter_idx = self.rng.randrange(0, len(self.mixup.filters))
+                x_pm1 = 2.0 * x - 1.0
+                view = self.mixup.filters[filter_idx].forward(x_pm1, m)
+                y01 = (view + 1.0) / 2.0
+            elif self.aug_mode == "raffe_filter":
+                if raffe_indices_1 is None:
+                    raffe_indices_1 = self.raffe_bank.sample_indices(
+                        self.rng, channels=x.shape[1])
+                y01 = self.raffe_bank.apply(x, m, raffe_indices_1)
+            else:  # raffe_smooth_mix
+                h, w = x.shape[-2:]
+                if raffe_indices_1 is None:
+                    raffe_indices_1 = self.raffe_bank.sample_indices(
+                        self.rng, channels=x.shape[1])
+                if raffe_indices_2 is None:
+                    raffe_indices_2 = self.raffe_bank.sample_indices(
+                        self.rng, channels=x.shape[1])
+                if blend_mask is None:
+                    blend_mask = self.raffe_smooth.generate(self.rng, h, w)
+                v1 = self.raffe_bank.apply(x, m, raffe_indices_1)
+                v2 = self.raffe_bank.apply(x, m, raffe_indices_2)
+                bm = blend_mask.to(device=x.device, dtype=x.dtype)
+                bm = bm.view(1, 1, h, w)
+                y01 = bm * v1 + (1.0 - bm) * v2
+                y01 = y01.clamp(0.0, 1.0) * m
             return y01.squeeze(0) if squeeze else y01
 
     def anchor(self, img01, mask01):
