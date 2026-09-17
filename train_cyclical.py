@@ -15,7 +15,8 @@ from utils.reproducibility import set_seeds, get_rng_states, set_rng_states
 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from utils.schedulers import (DampedCosineLRSchedule, DampedCosineError,
-                              validate_damped_cosine_config)
+                              validate_damped_cosine_config,
+                              damped_cosine_schedule_max)
 
 # argument parsing
 parser = argparse.ArgumentParser()
@@ -51,6 +52,13 @@ parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine'
 parser.add_argument('--dc_alpha', type=float, default=3.0,
                     help='damped_cosine: envelope decay strength; must be > -1 '
                          '(negative values in (-1, 0) inflate the lr peaks above max_lr over training)')
+parser.add_argument('--dc_inflate_max_lr', type=float, default=0.1,
+                    help='damped_cosine: hard cap on the lr for inflation mode (alpha < 0); '
+                         'the growing envelope is clamped so lr never exceeds this. '
+                         'Must be > max_lr. No effect for alpha >= 0 [default: %(default)s]')
+parser.add_argument('--dc_show_max_lr', action='store_true',
+                    help='query mode: print the highest lr the run will ever hit with these settings '
+                         '(and at which cycle/epoch/update), then exit without training')
 parser.add_argument('--dc_d', type=float, default=0.95, help='damped_cosine: oscillation depth in [0, 1]')
 parser.add_argument('--dc_period', type=int, default=0,
                     help='damped_cosine: oscillation period in optimizer updates '
@@ -338,6 +346,45 @@ if __name__ == '__main__':
     else:
         sys.exit('im_size should be a number or a tuple of two numbers')
 
+    ### QUERY MODE: print the highest lr the run will ever hit, and where
+    if args.dc_show_max_lr:
+        import pandas as pd
+        n_images = len(pd.read_csv(args.csv_train))
+        updates_per_epoch = math.ceil(math.ceil(n_images / bs) / (grad_acc_steps + 1))
+        total_updates = updates_per_epoch * sum(cycle_lens)
+        period = args.dc_period if args.dc_period != 0 else 2 * cycle_lens[0] * updates_per_epoch
+        try:
+            validate_damped_cosine_config(total_updates, period, args.dc_alpha, args.dc_d,
+                                          max_lr, min_lr, inflate_max_lr=args.dc_inflate_max_lr)
+        except DampedCosineError as e:
+            sys.exit('invalid damped_cosine configuration: {}'.format(e))
+        best_lr, best_t, ties = damped_cosine_schedule_max(total_updates, period, args.dc_alpha,
+                                                           args.dc_d, max_lr, min_lr,
+                                                           inflate_max_lr=args.dc_inflate_max_lr)
+        # locate best_t inside the cycle/epoch grid
+        global_epoch0 = best_t // updates_per_epoch  # 0-based global epoch
+        rem, cycle, epoch_in_cycle = global_epoch0, len(cycle_lens), cycle_lens[-1]
+        for c, clen in enumerate(cycle_lens, 1):
+            if rem < clen:
+                cycle, epoch_in_cycle = c, rem + 1
+                break
+            rem -= clen
+        print('* damped_cosine over {} cycles x {} epochs ({} optimizer updates, {}/epoch, period {}):'.format(
+            len(cycle_lens), cycle_lens[0], total_updates, updates_per_epoch, period))
+        print('  highest lr ever hit: {:.6e}  (alpha={}, d={}, lr_max={}, lr_min={}, inflate_max_lr={})'.format(
+            best_lr, args.dc_alpha, args.dc_d, max_lr, min_lr, args.dc_inflate_max_lr))
+        print('  first reached at: cycle {}/{}, epoch {}/{} (global epoch {}, optimizer update {}/{})'.format(
+            cycle, len(cycle_lens), epoch_in_cycle, cycle_lens[cycle-1],
+            global_epoch0 + 1, best_t + 1, total_updates))
+        if ties > 1:
+            print('  note: {} updates reach this same value (repeated capped peaks)'.format(ties))
+        if args.scheduler == 'cosine':
+            print('  note: --scheduler cosine is active; the original schedule peaks at max_lr = {} '
+                  'every second cycle'.format(max_lr))
+        if args.csv_test is not None:
+            print('  note: query ignores --csv_test; pseudo-label-extended datasets have more updates/epoch')
+        sys.exit(0)
+
     do_not_save = str2bool(args.do_not_save)
     if do_not_save is False:
         save_path = args.save_path
@@ -412,12 +459,13 @@ if __name__ == '__main__':
         dc_period = args.dc_period if args.dc_period != 0 else 2 * cycle_lens[0] * updates_per_epoch
         try:
             validate_damped_cosine_config(total_planned_updates, dc_period, args.dc_alpha, args.dc_d,
-                                          max_lr, min_lr)
+                                          max_lr, min_lr, inflate_max_lr=args.dc_inflate_max_lr)
         except DampedCosineError as e:
             sys.exit('invalid damped_cosine configuration: {}'.format(e))
         scheduler = DampedCosineLRSchedule(optimizer, total_updates=total_planned_updates,
                                            period=dc_period, alpha=args.dc_alpha, d=args.dc_d,
-                                           lr_max=max_lr, lr_min=min_lr)
+                                           lr_max=max_lr, lr_min=min_lr,
+                                           inflate_max_lr=args.dc_inflate_max_lr)
     else:
         # original scheduler, behavior preserved exactly (note: eta_min=0 regardless of --min_lr)
         scheduler = CosineAnnealingLR(optimizer, T_max=cycle_lens[0] * len(train_loader), eta_min=0)
@@ -429,8 +477,8 @@ if __name__ == '__main__':
     print('* Scheduler: {} -- {} planned optimizer updates ({} per epoch x {} epochs)'.format(
         args.scheduler, total_planned_updates, updates_per_epoch, sum(cycle_lens)))
     if args.scheduler == 'damped_cosine':
-        print('  damped_cosine: alpha={}, d={}, period={} updates, lr_max={}, lr_min={}'.format(
-            args.dc_alpha, args.dc_d, dc_period, max_lr, min_lr))
+        print('  damped_cosine: alpha={}, d={}, period={} updates, lr_max={}, lr_min={}, inflate_max_lr={}'.format(
+            args.dc_alpha, args.dc_d, dc_period, max_lr, min_lr, args.dc_inflate_max_lr))
 
     # (re)save config including resolved schedule information
     if do_not_save is False:

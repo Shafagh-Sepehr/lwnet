@@ -45,7 +45,8 @@ class DampedCosineError(ValueError):
     """Raised when damped-cosine scheduler settings are invalid."""
 
 
-def validate_damped_cosine_config(total_updates, period, alpha, d, lr_max, lr_min):
+def validate_damped_cosine_config(total_updates, period, alpha, d, lr_max, lr_min,
+                                  inflate_max_lr=None):
     """Validate damped-cosine settings; raise DampedCosineError with a clear message."""
     if not isinstance(total_updates, int) or total_updates < 1:
         raise DampedCosineError(
@@ -65,17 +66,72 @@ def validate_damped_cosine_config(total_updates, period, alpha, d, lr_max, lr_mi
     if lr_max <= lr_min:
         raise DampedCosineError(
             f"lr_max must be > lr_min, got lr_max={lr_max}, lr_min={lr_min}")
+    if inflate_max_lr is not None:
+        # lr(0) == lr_max already, so a cap at or below lr_max is contradictory
+        if inflate_max_lr <= lr_max:
+            raise DampedCosineError(
+                f"dc_inflate_max_lr must be > lr_max (lr(0) alone starts at lr_max={lr_max}), "
+                f"got {inflate_max_lr}")
 
 
-def damped_cosine_lr(t, total_updates, period, alpha, d, lr_max, lr_min):
-    """Closed-form damped-cosine learning rate at zero-based update index t."""
+def _envelope(t, total_updates, alpha):
     if total_updates == 1:
         progress = 0.0  # single-update schedule: avoid division by zero
     else:
         progress = t / (total_updates - 1)
-    envelope = 1.0 / (1.0 + alpha * progress)
+    return 1.0 / (1.0 + alpha * progress)
+
+
+def damped_cosine_lr(t, total_updates, period, alpha, d, lr_max, lr_min,
+                     inflate_max_lr=None):
+    """Closed-form damped-cosine learning rate at zero-based update index t.
+
+    With inflate_max_lr set, the envelope is clamped so the lr never exceeds
+    inflate_max_lr (relevant for alpha < 0, where it would otherwise grow to
+    lr_max / (1 + alpha) at the end).
+    """
+    envelope = _envelope(t, total_updates, alpha)
+    if inflate_max_lr is not None:
+        cap = (inflate_max_lr - lr_min) / (lr_max - lr_min)
+        if envelope > cap:
+            envelope = cap
     oscillation = (1.0 + d * math.cos(2.0 * math.pi * t / period)) / (1.0 + d)
     return lr_min + (lr_max - lr_min) * envelope * oscillation
+
+
+def damped_cosine_max_lr(t, total_updates, alpha, lr_max, lr_min, inflate_max_lr=None):
+    """Peak lr reachable at update index t (envelope ceiling; no oscillation).
+
+    This is the local maximum of the oscillation around t: with alpha > 0 it
+    decays over training, with -1 < alpha < 0 it grows (capped at
+    inflate_max_lr when given).
+    """
+    envelope = _envelope(t, total_updates, alpha)
+    if inflate_max_lr is not None:
+        cap = (inflate_max_lr - lr_min) / (lr_max - lr_min)
+        if envelope > cap:
+            envelope = cap
+    return lr_min + (lr_max - lr_min) * envelope
+
+
+def damped_cosine_schedule_max(total_updates, period, alpha, d, lr_max, lr_min,
+                               inflate_max_lr=None):
+    """Exact global maximum of the DISCRETE schedule and where it happens.
+
+    Scans the lr actually used at every optimizer update t in [0, T-1]
+    (including the inflation cap). Returns (max_lr, argmax_t, n_ties) where
+    argmax_t is the first update attaining the max and n_ties counts updates
+    reaching the same value (e.g. repeated flat peaks once a cap binds).
+    """
+    best_t, best_lr, ties = 0, None, 0
+    for t in range(total_updates):
+        lr = damped_cosine_lr(t, total_updates, period, alpha, d, lr_max, lr_min,
+                              inflate_max_lr=inflate_max_lr)
+        if best_lr is None or lr > best_lr:
+            best_t, best_lr, ties = t, lr, 1
+        elif lr == best_lr:
+            ties += 1
+    return best_lr, best_t, ties
 
 
 class DampedCosineLRSchedule:
@@ -88,8 +144,10 @@ class DampedCosineLRSchedule:
     gradient accumulation.
     """
 
-    def __init__(self, optimizer, total_updates, period, alpha, d, lr_max, lr_min):
-        validate_damped_cosine_config(total_updates, period, alpha, d, lr_max, lr_min)
+    def __init__(self, optimizer, total_updates, period, alpha, d, lr_max, lr_min,
+                 inflate_max_lr=None):
+        validate_damped_cosine_config(total_updates, period, alpha, d, lr_max, lr_min,
+                                      inflate_max_lr=inflate_max_lr)
         self.optimizer = optimizer
         self.total_updates = total_updates
         self.period = period
@@ -97,6 +155,7 @@ class DampedCosineLRSchedule:
         self.d = float(d)
         self.lr_max = float(lr_max)
         self.lr_min = float(lr_min)
+        self.inflate_max_lr = None if inflate_max_lr is None else float(inflate_max_lr)
         # Per-parameter-group bounds: keep each group's intended lr ratio
         # (group_lr_min / group_lr_max == lr_min / lr_max for every group).
         self.group_lr_max = [float(group['lr']) for group in optimizer.param_groups]
@@ -105,11 +164,12 @@ class DampedCosineLRSchedule:
         self._apply_lr(self.last_update)
 
     def _lr_for_group(self, t, group_lr_max, group_lr_min):
-        if self.total_updates == 1:
-            progress = 0.0
-        else:
-            progress = t / (self.total_updates - 1)
-        envelope = 1.0 / (1.0 + self.alpha * progress)
+        envelope = _envelope(t, self.total_updates, self.alpha)
+        if self.inflate_max_lr is not None:
+            # group-agnostic cap on the envelope multiplier keeps group ratios
+            cap = (self.inflate_max_lr - self.lr_min) / (self.lr_max - self.lr_min)
+            if envelope > cap:
+                envelope = cap
         oscillation = (1.0 + self.d * math.cos(2.0 * math.pi * t / self.period)) / (1.0 + self.d)
         return group_lr_min + (group_lr_max - group_lr_min) * envelope * oscillation
 
@@ -139,6 +199,7 @@ class DampedCosineLRSchedule:
             'd': self.d,
             'lr_max': self.lr_max,
             'lr_min': self.lr_min,
+            'inflate_max_lr': self.inflate_max_lr,
             'group_lr_max': list(self.group_lr_max),
             'group_lr_min': list(self.group_lr_min),
             'last_update': self.last_update,
@@ -151,6 +212,7 @@ class DampedCosineLRSchedule:
         self.d = state['d']
         self.lr_max = state['lr_max']
         self.lr_min = state['lr_min']
+        self.inflate_max_lr = state.get('inflate_max_lr')
         self.group_lr_max = list(state['group_lr_max'])
         self.group_lr_min = list(state['group_lr_min'])
         self.last_update = state['last_update']
