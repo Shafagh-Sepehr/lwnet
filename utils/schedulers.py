@@ -9,9 +9,15 @@ where
     t      : zero-based optimizer-update index, 0 .. T-1
     T      : planned total optimizer updates (fixed before training)
     P      : oscillation period in optimizer updates
-    alpha  : nonnegative decay strength of the multiplicative envelope
+    alpha  : envelope decay strength; must be > -1
+             * alpha > 0: envelope shrinks over training (damping)
+             * alpha = 0: constant envelope (no decay)
+             * -1 < alpha < 0: envelope GROWS over training (inflation):
+               lr peaks exceed lr_max, up to lr_max/(1 + alpha) at the end.
+               Here lr_max is the *initial* peak, not a global upper bound.
+             (alpha <= -1 is invalid: the envelope divides by zero at t = T-1)
     d      : oscillation depth in [0, 1]
-    lr_max : learning rate at t=0 (upper bound)
+    lr_max : learning rate at t=0 (upper bound for alpha >= 0)
     lr_min : lower bound reached only asymptotically (envelope floor)
 
 Properties worth stating explicitly (they differ from the baseline
@@ -47,8 +53,11 @@ def validate_damped_cosine_config(total_updates, period, alpha, d, lr_max, lr_mi
     if not isinstance(period, int) or period < 1:
         raise DampedCosineError(
             f"oscillation period must be an integer >= 1 optimizer update, got {period!r}")
-    if alpha < 0:
-        raise DampedCosineError(f"alpha (decay strength) must be >= 0, got {alpha}")
+    if alpha <= -1:
+        raise DampedCosineError(
+            f"alpha must be > -1, got {alpha}: alpha <= -1 makes the envelope "
+            f"divide by zero at t = T-1 (and grow unboundedly before that); "
+            f"use -1 < alpha < 0 for an inflating envelope")
     if not (0.0 <= d <= 1.0):
         raise DampedCosineError(f"d (oscillation depth) must be in [0, 1], got {d}")
     if lr_min < 0:

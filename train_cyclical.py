@@ -48,7 +48,9 @@ parser.add_argument('--seed', type=int, default=0, help='seed')
 parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'damped_cosine'],
                     help="learning-rate schedule: 'cosine' (original CosineAnnealingLR behavior, default) "
                          "or 'damped_cosine' (decaying full-cosine oscillation)")
-parser.add_argument('--dc_alpha', type=float, default=3.0, help='damped_cosine: nonnegative envelope decay strength')
+parser.add_argument('--dc_alpha', type=float, default=3.0,
+                    help='damped_cosine: envelope decay strength; must be > -1 '
+                         '(negative values in (-1, 0) inflate the lr peaks above max_lr over training)')
 parser.add_argument('--dc_d', type=float, default=0.95, help='damped_cosine: oscillation depth in [0, 1]')
 parser.add_argument('--dc_period', type=int, default=0,
                     help='damped_cosine: oscillation period in optimizer updates '
