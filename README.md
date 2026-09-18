@@ -73,6 +73,12 @@ These are used only for training.
 ## 2. Training a W-Net for vessel segmentation
 Train a model on a given dataset. You also need to supply the path to save the model.
 Note that the training defaults to using the CPU, which is feasible due to the small size of our models.
+Checkpoint validation runs at cycle boundaries by default. Use `--checkpoint_interval epoch` for
+epoch-level checks. `--metric` accepts an ordered list such as `auc,dice,loss`; multi-metric
+policies use absolute near-tie tolerances (`auc=0.0005`, `dice=0.0001`, `loss=0.000001`) unless
+overridden with `--metric_tolerances`. A single metric remains strict unless an explicit tolerance
+is supplied. Comparisons are pairwise against the last selected checkpoint, so approximate equality
+is not transitive; `max_validation_auc_seen` in checkpoint metadata records the diagnostic maximum.
 To reproduce our results in table 2 of our paper, you need to run:
 ```
 python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 20/50

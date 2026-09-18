@@ -1,4 +1,4 @@
-import sys, json, os, argparse
+import sys, json, os, argparse, copy, random
 from shutil import copyfile, rmtree
 import os.path as osp
 from datetime import datetime
@@ -12,6 +12,7 @@ from utils.get_loaders import get_train_val_loaders
 from utils.evaluation import evaluate, ewma
 from utils.model_saving_loading import save_model, str2bool, load_model
 from utils.reproducibility import set_seeds
+from utils.checkpoint_selection import parse_metric_policy, compare_checkpoint
 
 from segmentation_losses import build_segmentation_loss
 
@@ -31,6 +32,8 @@ parser.add_argument('--min_lr', type=float, default=1e-8, help='learning rate')
 parser.add_argument('--max_lr', type=float, default=0.01, help='learning rate')
 parser.add_argument('--cycle_lens', type=str, default='20/50', help='cycling config (nr cycles/cycle len')
 parser.add_argument('--metric', type=str, default='auc', help='which metric to use for monitoring progress (tr_auc/auc/loss/dice)')
+parser.add_argument('--checkpoint_interval', choices=['cycle', 'epoch'], default='cycle', help='when to assess and compare checkpoints')
+parser.add_argument('--metric_tolerances', type=str, default=None, help='optional comma-separated metric=value absolute tolerances')
 parser.add_argument('--im_size', help='delimited list input, could be 600,400', type=str, default='512')
 parser.add_argument('--in_c', type=int, default=3, help='channels in input images')
 parser.add_argument('--do_not_save', type=str2bool, nargs='?', const=True, default=False, help='avoid saving anything')
@@ -169,8 +172,8 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
                     scheduler.step() # for grad_acc_steps=0, this means once
                 optimizer.zero_grad()
         if assess:
-            logits_all.extend(logits)
-            labels_all.extend(labels)
+            logits_all.extend(logits.detach())
+            labels_all.extend(labels.detach())
 
         # Compute running loss
         running_loss += loss.item() * inputs.size(0)
@@ -187,7 +190,7 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
     if assess: return logits_all, labels_all, run_loss, tr_lr, comp_means
     return None, None, run_loss, tr_lr, comp_means
 
-def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0, cycle=0):
+def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0, cycle=0, checkpoint_interval='cycle', epoch_callback=None):
 
     model.train()
     optimizer.zero_grad()
@@ -195,63 +198,99 @@ def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=No
 
     with tqdm(range(cycle_len)) as t:
         for epoch in t:
-            if epoch == cycle_len-1: assess=True # only get logits/labels on last cycle
-            else: assess = False
+            is_cycle_end = epoch == cycle_len - 1
+            assess = checkpoint_interval == 'epoch' or is_cycle_end
             tr_logits, tr_labels, tr_loss, tr_lr, tr_comps = run_one_epoch(train_loader, model, criterion, optimizer=optimizer,
                                                           scheduler=scheduler, grad_acc_steps=grad_acc_steps, assess=assess)
             t.set_postfix(tr_loss_lr="{:.4f}/{:.6f}".format(float(tr_loss), tr_lr))
+            if assess and epoch_callback is not None:
+                epoch_callback(tr_logits, tr_labels, tr_loss, tr_comps, cycle + 1, epoch + 1, is_cycle_end)
 
     return tr_logits, tr_labels, tr_loss, tr_comps
 
-def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, exp_path):
+def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, exp_path,
+                checkpoint_interval='cycle', metric_tolerances=None, do_not_save=False):
 
     n_cycles = len(scheduler.cycle_lens)
-    best_auc, best_dice, best_cycle = 0, 0, 0
-    is_better, best_monitoring_metric = compare_op(metric)
+    policy = parse_metric_policy(metric, metric_tolerances)
+    order = policy['metric_order']
+    tolerances = policy['metric_tolerances']
+    incumbent = None
+    selection_stats = None
+    max_validation_auc_seen = None
+    global_epoch = 0
+    completed_epochs = 0
+    history_path = osp.join(exp_path, 'checkpoint_history.jsonl') if exp_path and not do_not_save else None
+
+    def rng_state():
+        return (random.getstate(), np.random.get_state(), torch.get_rng_state(),
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None)
+
+    def restore_rng(state):
+        random.setstate(state[0]); np.random.set_state(state[1]); torch.set_rng_state(state[2])
+        if state[3] is not None:
+            torch.cuda.set_rng_state_all(state[3])
+
+    def assess_and_select(tr_logits, tr_labels, tr_loss, tr_comps, cycle, epoch_in_cycle, is_cycle_end):
+        nonlocal incumbent, selection_stats, max_validation_auc_seen, global_epoch
+        tr_auc, tr_dice = evaluate(tr_logits, tr_labels, model.n_classes)
+        del tr_logits, tr_labels
+        state = None if is_cycle_end else rng_state()
+        was_training = model.training
+        try:
+            with torch.no_grad():
+                vl_logits, vl_labels, vl_loss, _, vl_comps = run_one_epoch(val_loader, model, criterion, assess=True)
+                vl_auc, vl_dice = evaluate(vl_logits, vl_labels, model.n_classes)
+                del vl_logits, vl_labels
+        finally:
+            model.train(was_training)
+            if state is not None:
+                restore_rng(state)
+        current = {'auc': float(vl_auc), 'dice': float(vl_dice), 'loss': float(vl_loss), 'tr_auc': float(tr_auc)}
+        max_validation_auc_seen = current['auc'] if max_validation_auc_seen is None else max(max_validation_auc_seen, current['auc'])
+        selected, reason, details = compare_checkpoint(current, incumbent, order, tolerances)
+        print('Train/Val Loss: {:.4f}/{:.4f} -- Train/Val AUC: {:.4f}/{:.4f} -- Train/Val DICE: {:.4f}/{:.4f} -- LR={:.6f}'.format(
+            tr_loss, vl_loss, tr_auc, vl_auc, tr_dice, vl_dice, get_lr(optimizer)).rstrip('0'))
+        if tr_comps: print(format_loss_components('Train', tr_comps, criterion))
+        if vl_comps: print(format_loss_components('Val', vl_comps, criterion))
+        record = {'cycle': cycle, 'epoch_in_cycle': epoch_in_cycle, 'global_epoch': global_epoch,
+                  'metrics': current, 'incumbent_metrics': incumbent, 'comparison_reason': reason,
+                  'selected': selected, 'saved': False}
+        if selected:
+            incumbent = current.copy()
+            selection_stats = {'selection_policy_version': 1, 'checkpoint_interval': checkpoint_interval,
+                'metric_order': order, 'metric_tolerances': tolerances, 'selected_metrics': incumbent,
+                'best_cycle': cycle, 'best_epoch_in_cycle': epoch_in_cycle, 'best_global_epoch': global_epoch,
+                'selection_reason': reason, 'max_validation_auc_seen': max_validation_auc_seen}
+            if exp_path and not do_not_save:
+                save_model(exp_path, model, optimizer, stats=selection_stats)
+                record['saved'] = True
+        if history_path:
+            with open(history_path, 'a') as history:
+                history.write(json.dumps(record) + '\n')
+        return current
 
     for cycle in range(n_cycles):
         print('Cycle {:d}/{:d}'.format(cycle+1, n_cycles))
-        # train one cycle, retrieve segmentation data and compute metrics at the end of cycle
-        tr_logits, tr_labels, tr_loss, tr_comps = train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle)
-
-        # classification metrics at the end of cycle
-        print(25 * '-' + '  End of cycle, evaluating ' + 25 * '-')
-        tr_auc, tr_dice = evaluate(tr_logits, tr_labels, model.n_classes)  # for n_classes>1, will need to redo evaluate
-        del tr_logits, tr_labels
-        with torch.no_grad():
-            assess=True
-            vl_logits, vl_labels, vl_loss, _, vl_comps = run_one_epoch(val_loader, model, criterion, assess=assess)
-            vl_auc, vl_dice = evaluate(vl_logits, vl_labels, model.n_classes)  # for n_classes>1, will need to redo evaluate
-            del vl_logits, vl_labels
-        print('Train/Val Loss: {:.4f}/{:.4f}  -- Train/Val AUC: {:.4f}/{:.4f}  -- Train/Val DICE: {:.4f}/{:.4f} -- LR={:.6f}'.format(
-                tr_loss, vl_loss, tr_auc, vl_auc, tr_dice, vl_dice, get_lr(optimizer)).rstrip('0'))
-        # Enabled unweighted loss components, their weighted contributions and
-        # total (total is the Train/Val Loss above). Note: validation total
-        # loss is objective-specific and cannot be compared numerically across
-        # different weight configurations as evidence of superiority.
-        if tr_comps: print(format_loss_components('Train', tr_comps, criterion))
-        if vl_comps: print(format_loss_components('Val', vl_comps, criterion))
-
-        # check if performance was better than anyone before and checkpoint if so
-        if metric == 'auc':
-            monitoring_metric = vl_auc
-        elif metric == 'tr_auc':
-            monitoring_metric = tr_auc
-        elif metric == 'loss':
-            monitoring_metric = vl_loss
-        elif metric == 'dice':
-            monitoring_metric = vl_dice
-        if is_better(monitoring_metric, best_monitoring_metric):
-            print('Best {} attained. {:.2f} --> {:.2f}'.format(metric, 100*best_monitoring_metric, 100*monitoring_metric))
-            best_auc, best_dice, best_cycle = vl_auc, vl_dice, cycle+1
-            best_monitoring_metric = monitoring_metric
-            if exp_path is not None:
-                print(25 * '-', ' Checkpointing ', 25 * '-')
-                save_model(exp_path, model, optimizer)
+        cycle_start = completed_epochs
+        def callback(*args):
+            nonlocal global_epoch
+            global_epoch = cycle_start + args[5]
+            return assess_and_select(*args)
+        train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle,
+                        checkpoint_interval=checkpoint_interval, epoch_callback=callback)
+        completed_epochs += scheduler.cycle_lens[cycle]
 
     del model
     torch.cuda.empty_cache()
-    return best_auc, best_dice, best_cycle
+    if selection_stats is None:
+        return {'val_auc': None, 'val_dice': None, 'val_loss': None, 'best_cycle': 0,
+                'best_epoch_in_cycle': 0, 'best_global_epoch': 0, 'selected_metrics': None}
+    return {'val_auc': selection_stats['selected_metrics'].get('auc'),
+            'val_dice': selection_stats['selected_metrics'].get('dice'),
+            'val_loss': selection_stats['selected_metrics'].get('loss'),
+            'best_cycle': selection_stats['best_cycle'], 'best_epoch_in_cycle': selection_stats['best_epoch_in_cycle'],
+            'best_global_epoch': selection_stats['best_global_epoch'], 'selected_metrics': selection_stats['selected_metrics']}
 
 if __name__ == '__main__':
     '''
@@ -260,6 +299,14 @@ if __name__ == '__main__':
     '''
 
     args = parser.parse_args()
+
+    try:
+        selection_policy = parse_metric_policy(args.metric, args.metric_tolerances)
+    except ValueError as e:
+        parser.error(str(e))
+    args.metric = selection_policy['metric']
+    args.metric_order = selection_policy['metric_order']
+    args.resolved_metric_tolerances = selection_policy['metric_tolerances']
 
     # FreeSDG FMAug argument validation (plan §11)
     if args.freesdg:
@@ -306,7 +353,7 @@ if __name__ == '__main__':
     # gather parser parameters
     model_name = args.model_name
     max_lr, min_lr, bs, grad_acc_steps = args.max_lr, args.min_lr, args.batch_size, args.grad_acc_steps
-    cycle_lens, metric = args.cycle_lens.split('/'), args.metric
+    cycle_lens, metric = args.cycle_lens.split('/'), selection_policy['metric']
     cycle_lens = list(map(int, cycle_lens))
 
     if len(cycle_lens)==2: # handles option of specifying cycles as pair (n_cycles, cycle_len)
@@ -410,12 +457,20 @@ if __name__ == '__main__':
     print('* Starting to train\n','-' * 10)
 
 
-    m1, m2, m3=train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, experiment_path)
+    result = train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps,
+                         metric, experiment_path, checkpoint_interval=args.checkpoint_interval,
+                         metric_tolerances=args.metric_tolerances, do_not_save=do_not_save)
 
-    print("val_auc: %f" % m1)
-    print("val_dice: %f" % m2)
-    print("best_cycle: %d" % m3)
+    print("val_auc: %s" % result['val_auc'])
+    print("val_dice: %s" % result['val_dice'])
+    print("val_loss: %s" % result['val_loss'])
+    print("best_cycle: %d" % result['best_cycle'])
+    print("best_epoch_in_cycle: %d" % result['best_epoch_in_cycle'])
+    print("best_global_epoch: %d" % result['best_global_epoch'])
     if do_not_save is False:
+        if result['selected_metrics'] is None:
+            print('No valid checkpoint was selected; validation metrics were non-finite.')
+            sys.exit(1)
         # file = open(osp.join(experiment_path, 'val_metrics.txt'), 'w')
         # file.write(str(m1)+ '\n')
         # file.write(str(m2)+ '\n')
@@ -423,4 +478,6 @@ if __name__ == '__main__':
         # file.close()
 
         with open(osp.join(experiment_path, 'val_metrics.txt'), 'w') as f:
-            print('Best AUC = {:.2f}\nBest DICE = {:.2f}\nBest cycle = {}'.format(100*m1, 100*m2, m3), file=f)
+            print('Best AUC = {:.2f}\nBest DICE = {:.2f}\nBest loss = {:.8f}\nBest cycle = {}\nBest epoch in cycle = {}\nBest global epoch = {}'.format(
+                100 * result['val_auc'], 100 * result['val_dice'], result['val_loss'], result['best_cycle'],
+                result['best_epoch_in_cycle'], result['best_global_epoch']), file=f)
