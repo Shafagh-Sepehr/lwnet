@@ -140,11 +140,19 @@ class FourierButterworthView:
         self.n = int(n)
         self.fmap = build_corner_butterworth_map(height, width, self.d0_ratio,
                                                  self.n)
+        # Keep one device-local copy per execution dtype.  Raffe views are
+        # reused for every sample, so avoiding a host-to-device map copy on
+        # every call matters for the CUDA path.  The map values are unchanged.
+        self._fmap_cache = {}
 
     def __call__(self, x01, mask01):
         if x01.dim() != 4:
             raise ValueError("x01 must be [B, C, H, W] in [0,1]")
-        fmap = self.fmap.to(device=x01.device, dtype=x01.dtype)
+        cache_key = (x01.device, x01.dtype)
+        fmap = self._fmap_cache.get(cache_key)
+        if fmap is None:
+            fmap = self.fmap.to(device=x01.device, dtype=x01.dtype)
+            self._fmap_cache[cache_key] = fmap
         spec = torch.fft.fft2(x01) * fmap
         res = torch.abs(torch.fft.ifft2(spec))  # >= 0 by construction
         # Fastest percentile path is chosen automatically: numpy on CPU (its
@@ -223,8 +231,24 @@ class RaffeFilterBank:
 
     def apply(self, x01, mask01, indices):
         views = self.views(x01.shape[-2], x01.shape[-1])
-        return torch.cat([views[indices[c]](x01[:, c:c + 1], mask01)
-                          for c in range(x01.shape[1])], dim=1)
+        if len(indices) != x01.shape[1]:
+            raise ValueError("one Raffe filter index is required per channel")
+
+        # Preserve the official independent per-channel sampling while
+        # batching channels that use the same bank entry.  Each group still
+        # receives the exact same FFT, percentile, and FOV-mask operations;
+        # grouping only removes redundant CUDA launches.
+        groups = {}
+        for channel, index in enumerate(indices):
+            groups.setdefault(int(index), []).append(channel)
+        out = torch.empty_like(x01)
+        for index, channels in groups.items():
+            channel_idx = torch.tensor(channels, device=x01.device,
+                                       dtype=torch.long)
+            grouped = x01.index_select(1, channel_idx)
+            filtered = views[index](grouped, mask01)
+            out.index_copy_(1, channel_idx, filtered)
+        return out
 
 
 # Bounded cache of integer coordinate grids for the direct mask calculation.
