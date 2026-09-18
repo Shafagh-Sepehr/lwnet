@@ -190,21 +190,24 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
     if assess: return logits_all, labels_all, run_loss, tr_lr, comp_means
     return None, None, run_loss, tr_lr, comp_means
 
-def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0, cycle=0, checkpoint_interval='cycle', epoch_callback=None):
+def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0,
+                    cycle=0, checkpoint_interval='cycle', epoch_callback=None):
 
     model.train()
     optimizer.zero_grad()
     cycle_len = scheduler.cycle_lens[cycle]
 
-    with tqdm(range(cycle_len)) as t:
-        for epoch in t:
+    with tqdm(total=cycle_len) as t:
+        for epoch in range(cycle_len):
             is_cycle_end = epoch == cycle_len - 1
             assess = checkpoint_interval == 'epoch' or is_cycle_end
             tr_logits, tr_labels, tr_loss, tr_lr, tr_comps = run_one_epoch(train_loader, model, criterion, optimizer=optimizer,
                                                           scheduler=scheduler, grad_acc_steps=grad_acc_steps, assess=assess)
             t.set_postfix(tr_loss_lr="{:.4f}/{:.6f}".format(float(tr_loss), tr_lr))
             if assess and epoch_callback is not None:
-                epoch_callback(tr_logits, tr_labels, tr_loss, tr_comps, cycle + 1, epoch + 1, is_cycle_end)
+                epoch_callback(tr_logits, tr_labels, tr_loss, tr_comps, cycle + 1, epoch + 1,
+                               is_cycle_end, t.write)
+            t.update(1)
 
     return tr_logits, tr_labels, tr_loss, tr_comps
 
@@ -231,7 +234,8 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
         if state[3] is not None:
             torch.cuda.set_rng_state_all(state[3])
 
-    def assess_and_select(tr_logits, tr_labels, tr_loss, tr_comps, cycle, epoch_in_cycle, is_cycle_end):
+    def assess_and_select(tr_logits, tr_labels, tr_loss, tr_comps, cycle, epoch_in_cycle,
+                          is_cycle_end, progress_write):
         nonlocal incumbent, selection_stats, max_validation_auc_seen, global_epoch
         tr_auc, tr_dice = evaluate(tr_logits, tr_labels, model.n_classes)
         del tr_logits, tr_labels
@@ -249,20 +253,30 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
         current = {'auc': float(vl_auc), 'dice': float(vl_dice), 'loss': float(vl_loss), 'tr_auc': float(tr_auc)}
         max_validation_auc_seen = current['auc'] if max_validation_auc_seen is None else max(max_validation_auc_seen, current['auc'])
         selected, reason, details = compare_checkpoint(current, incumbent, order, tolerances)
-        print('Train/Val Loss: {:.4f}/{:.4f} -- Train/Val AUC: {:.4f}/{:.4f} -- Train/Val DICE: {:.4f}/{:.4f} -- LR={:.6f}'.format(
+        progress_write('Train/Val Loss: {:.4f}/{:.4f} -- Train/Val AUC: {:.4f}/{:.4f} -- Train/Val DICE: {:.4f}/{:.4f} -- LR={:.6f}'.format(
             tr_loss, vl_loss, tr_auc, vl_auc, tr_dice, vl_dice, get_lr(optimizer)).rstrip('0'))
-        if tr_comps: print(format_loss_components('Train', tr_comps, criterion))
-        if vl_comps: print(format_loss_components('Val', vl_comps, criterion))
+        if tr_comps: progress_write(format_loss_components('Train', tr_comps, criterion))
+        if vl_comps: progress_write(format_loss_components('Val', vl_comps, criterion))
         record = {'cycle': cycle, 'epoch_in_cycle': epoch_in_cycle, 'global_epoch': global_epoch,
                   'metrics': current, 'incumbent_metrics': incumbent, 'comparison_reason': reason,
                   'selected': selected, 'saved': False}
         if selected:
+            previous = incumbent
             incumbent = current.copy()
             selection_stats = {'selection_policy_version': 1, 'checkpoint_interval': checkpoint_interval,
                 'metric_order': order, 'metric_tolerances': tolerances, 'selected_metrics': incumbent,
                 'best_cycle': cycle, 'best_epoch_in_cycle': epoch_in_cycle, 'best_global_epoch': global_epoch,
                 'selection_reason': reason, 'max_validation_auc_seen': max_validation_auc_seen}
+            if previous is None:
+                progress_write('Best checkpoint initialized: {}={:.8f} (cycle {}, epoch {}, global epoch {})'.format(
+                    reason if reason in current else order[0], current[reason] if reason in current else current[order[0]],
+                    cycle, epoch_in_cycle, global_epoch))
+            else:
+                progress_write('Best {} attained: incumbent={} -> candidate={:.8f} (cycle {}, epoch {}, global epoch {})'.format(
+                    reason, previous.get(reason, float('nan')), current.get(reason, float('nan')),
+                    cycle, epoch_in_cycle, global_epoch))
             if exp_path and not do_not_save:
+                progress_write('-------------------------  Checkpointing  -------------------------')
                 save_model(exp_path, model, optimizer, stats=selection_stats)
                 record['saved'] = True
         if history_path:
