@@ -119,16 +119,36 @@ class UNet(nn.Module):
 
         self.final = nn.Conv2d(layers[0], n_classes, kernel_size=1)
 
-    def forward(self, x):
+    def forward(self, x, return_decoder_features=False, decoder_additions=None):
         x = self.first(x)
         down_activations = []
         for i, down in enumerate(self.down_path):
             down_activations.append(x)
             x = down(x)
         down_activations.reverse()
+
+        if decoder_additions is not None and len(decoder_additions) != len(self.up_path):
+            raise ValueError('decoder_additions must match the number of decoder stages')
+
+        decoder_features = []
         for i, up in enumerate(self.up_path):
             x = up(x, down_activations[i])
-        return self.final(x)
+
+            if decoder_additions is not None:
+                addition = decoder_additions[i]
+                if addition is not None:
+                    if addition.shape != x.shape:
+                        raise RuntimeError(
+                            'cross-stage bridge shape mismatch at decoder stage {}: {} vs {}'.format(
+                                i, tuple(addition.shape), tuple(x.shape)))
+                    x = x + addition       # not in-place
+
+            decoder_features.append(x)
+
+        logits = self.final(x)
+        if return_decoder_features:
+            return logits, tuple(decoder_features)
+        return logits
 
 class WNet(nn.Module):
     def __init__(self, in_c, n_classes, layers, k_sz=3, up_mode='transp_conv', conv_bridge=True, shortcut=True):

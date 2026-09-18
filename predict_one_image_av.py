@@ -11,7 +11,7 @@ from skimage.io import imsave
 from skimage.util import img_as_ubyte
 from skimage.transform import resize
 import torch
-from models.get_model import get_arch
+from models.get_model import get_arch, get_arch_options, set_eval_mode
 from utils.model_saving_loading import load_model
 from skimage.measure import regionprops
 
@@ -179,7 +179,17 @@ if __name__ == '__main__':
 
     tta = args.tta
 
-    model_name = 'big_wnet'
+    # Recover architecture (model_name + bridge options) from the model
+    # directory's config.cfg; fall back to the legacy big_wnet/n_classes=4
+    # defaults when no config exists.
+    import json
+    model_cfg = {}
+    config_file = osp.join(args.model_path, 'config.cfg')
+    if osp.isfile(config_file):
+        with open(config_file, 'r') as f:
+            model_cfg = json.load(f)
+
+    model_name = model_cfg.get('model_name', 'big_wnet')
     model_path = args.model_path
     im_path = args.im_path
     im_loc = osp.dirname(im_path)
@@ -222,8 +232,9 @@ if __name__ == '__main__':
     im_tens = tr(img)  # only transform image
 
     print('* Instantiating model  = ' + str(model_name))
-    model = get_arch(model_name, n_classes=4).to(device)
-    if model_name == 'big_wnet': model.mode='eval'
+    arch_opts = get_arch_options(model_cfg)
+    model = get_arch(model_name, n_classes=4, **arch_opts).to(device)
+    set_eval_mode(model)
 
     print('* Loading trained weights from ' + model_path)
     model, stats = load_model(model, model_path, device)

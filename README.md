@@ -98,6 +98,32 @@ As CHASE-DB has less training images than DRIVE (8 vs 16), we double the number 
 Note that we use a `batch_size` of 4 by default, and that we train on HRF with an image size of `1024x1024`.
 In order to train on a single GPU, we use gradient accumulation in that case.
 
+## 2.1 Gated cross-stage decoder bridges (A1)
+
+The W-Net can optionally give U-Net 2 direct access to U-Net 1's multi-scale decoder
+representations through zero-initialized gated residual bridges. At each selected decoder
+stage `i`, the U2 feature is updated as `u2_feature_i = u2_feature_i + alpha_i * u1_feature_i`,
+where `alpha_i` is a learned gate initialized to exactly zero. Before any training update the
+bridged model therefore reproduces the original W-Net exactly.
+
+Three training options control the bridge:
+
+| Option | Meaning |
+|---|---|
+| `--cross_stage_bridge none|scalar|channel` | `none` (default) is the legacy architecture; `scalar` adds one gate per selected scale; `channel` adds one gate per channel per scale. |
+| `--cross_stage_bridge_scales all|quarter,half,full` | Which decoder scales to bridge. `all` canonicalizes to `half,full` for `wnet` and `quarter,half,full` for `big_wnet`. |
+| `--cross_stage_bridge_init 0.0` | Initial raw gate value; the A1 default is exactly `0.0`. |
+
+Primary experiment (pair it against an identical control with `--cross_stage_bridge none`):
+
+```
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 20/50 --model_name wnet --cross_stage_bridge scalar --cross_stage_bridge_scales all --cross_stage_bridge_init 0.0 --checkpoint_interval epoch --metric auc,dice,loss --batch_size 4 --im_size 512 --device cuda:0 --save_path wnet_drive_a1_scalar_all_seed0 --seed 0
+```
+
+Inference requires no new bridge flags: when `--config_file` (or a model directory containing
+`config.cfg`) is supplied, the bridge architecture is recovered automatically and the checkpoint
+is loaded strictly.
+
 ## 3. Generating segmentations
 Once the model is trained, you can produce the corresponding segmentations calling `generate_results.py` and specifying which dataset should be used:
 ```

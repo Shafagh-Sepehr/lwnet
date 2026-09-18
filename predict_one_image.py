@@ -11,7 +11,7 @@ from skimage.io import imsave
 from skimage.util import img_as_ubyte
 from skimage.transform import resize
 import torch
-from models.get_model import get_arch
+from models.get_model import get_arch, get_arch_options, set_eval_mode
 from utils.model_saving_loading import load_model
 from skimage.measure import regionprops
 
@@ -183,7 +183,8 @@ if __name__ == '__main__':
               'config has no active FreeSDG fields (freesdg=false or absent); '
               'anchor preprocessing is skipped and raw input is used (plan §29.2).')
 
-    model_name = 'wnet'
+    model_name = model_cfg.get('model_name', 'wnet')
+    in_c = model_cfg.get('in_c', 3)
     model_path = args.model_path
     im_path = args.im_path
     im_loc = osp.dirname(im_path)
@@ -247,8 +248,9 @@ if __name__ == '__main__':
         im_tens = anchoror.anchor(im_tens, tvF.to_tensor(mask_rsz))
 
     print('* Instantiating model  = ' + str(model_name))
-    model = get_arch(model_name).to(device)
-    if model_name == 'wnet': model.mode='eval'
+    arch_opts = get_arch_options(model_cfg)
+    model = get_arch(model_name, in_c=in_c, **arch_opts).to(device)
+    set_eval_mode(model)
 
     print('* Loading trained weights from ' + model_path)
     model, stats = load_model(model, model_path, device)

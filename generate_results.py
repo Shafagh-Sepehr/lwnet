@@ -12,7 +12,7 @@ from skimage.util import img_as_ubyte
 from skimage.transform import resize
 import torch
 from utils.model_saving_loading import str2bool
-from models.get_model import get_arch
+from models.get_model import get_arch, get_arch_options, set_eval_mode
 from utils.get_loaders import get_test_dataset
 from utils.model_saving_loading import load_model
 
@@ -162,8 +162,9 @@ if __name__ == '__main__':
     print('* Reading test data from ' + osp.join(data_path, csv_path))
     test_dataset = get_test_dataset(data_path, csv_path=csv_path, tg_size=tg_size)
     print('* Instantiating model  = ' + str(model_name))
-    model = get_arch(model_name, in_c=in_c).to(device)
-    if model_name == 'wnet': model.mode='eval'
+    arch_opts = get_arch_options(args)
+    model = get_arch(model_name, in_c=in_c, **arch_opts).to(device)
+    set_eval_mode(model)
 
     print('* Loading trained weights from ' + experiment_path)
     try:

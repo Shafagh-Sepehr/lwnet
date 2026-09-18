@@ -6,7 +6,7 @@ import operator
 from tqdm import tqdm
 import numpy as np
 import torch
-from models.get_model import get_arch
+from models.get_model import get_arch, get_arch_options, validate_cross_stage_bridge
 
 from utils.get_loaders import get_train_val_loaders
 from utils.evaluation import evaluate, ewma
@@ -67,6 +67,13 @@ parser.add_argument('--loss_dice_weight', type=float, default=0.0, help='weight 
 parser.add_argument('--loss_cldice_weight', type=float, default=0.0, help='weight of the foreground soft-clDice topology term')
 parser.add_argument('--loss_boundary_weight', type=float, default=0.0, help='weight of the signed-distance boundary term (distances in pixels: resolution/scale dependent, pilot at 0.01)')
 parser.add_argument('--loss_cldice_iters', type=int, default=10, help='soft-skeleton erosion iterations for the clDice term')
+# Zero-initialized gated cross-stage decoder bridges (A1)
+parser.add_argument('--cross_stage_bridge', choices=['none', 'scalar', 'channel'], default='none',
+                    help='U1-decoder to U2-decoder gated residual bridge type')
+parser.add_argument('--cross_stage_bridge_scales', type=str, default='all',
+                    help='all or a comma-separated subset of quarter,half,full')
+parser.add_argument('--cross_stage_bridge_init', type=float, default=0.0,
+                    help='initial raw bridge gate value; A1 default is exactly 0.0')
 
 
 def compare_op(metric):
@@ -257,9 +264,16 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
             tr_loss, vl_loss, tr_auc, vl_auc, tr_dice, vl_dice, get_lr(optimizer)).rstrip('0'))
         if tr_comps: progress_write(format_loss_components('Train', tr_comps, criterion))
         if vl_comps: progress_write(format_loss_components('Val', vl_comps, criterion))
+        gate_summary = None
+        if hasattr(model, 'bridge_gate_summary'):
+            gate_summary = model.bridge_gate_summary()
+        if gate_summary:
+            progress_write('Bridge gates: {}'.format(gate_summary))
         record = {'cycle': cycle, 'epoch_in_cycle': epoch_in_cycle, 'global_epoch': global_epoch,
                   'metrics': current, 'incumbent_metrics': incumbent, 'comparison_reason': reason,
                   'selected': selected, 'saved': False}
+        if gate_summary:
+            record['bridge_gates'] = gate_summary
         if selected:
             previous = incumbent
             incumbent = current.copy()
@@ -267,6 +281,8 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
                 'metric_order': order, 'metric_tolerances': tolerances, 'selected_metrics': incumbent,
                 'best_cycle': cycle, 'best_epoch_in_cycle': epoch_in_cycle, 'best_global_epoch': global_epoch,
                 'selection_reason': reason, 'max_validation_auc_seen': max_validation_auc_seen}
+            if gate_summary:
+                selection_stats['bridge_gates'] = gate_summary
             if previous is None:
                 progress_write('Best checkpoint initialized: {}={:.8f} (cycle {}, epoch {}, global epoch {})'.format(
                     reason if reason in current else order[0], current[reason] if reason in current else current[order[0]],
@@ -328,6 +344,16 @@ if __name__ == '__main__':
             sys.exit('--freesdg_raw_prob must be within [0, 1]')
         if args.freesdg_mixup_size == 0 or args.freesdg_mixup_size < -1:
             sys.exit('--freesdg_mixup_size must be -1 (random) or > 0 (fixed square); 0 is not a valid mode')
+
+    # Cross-stage bridge validation/canonicalization (A1): canonical values are
+    # what get serialized into config.cfg and passed to get_arch().
+    try:
+        args.cross_stage_bridge, args.cross_stage_bridge_scales, args.cross_stage_bridge_init = \
+            validate_cross_stage_bridge(
+                args.cross_stage_bridge, args.cross_stage_bridge_scales,
+                args.cross_stage_bridge_init, args.model_name)
+    except ValueError as e:
+        parser.error(str(e))
 
     im_size_tmp = tuple([int(item) for item in args.im_size.split(',')])
     tg_size_tmp = (im_size_tmp[0], im_size_tmp[0]) if len(im_size_tmp) == 1 else tuple(im_size_tmp[:2])
@@ -437,10 +463,14 @@ if __name__ == '__main__':
 
 
     print('* Instantiating a {} model'.format(model_name))
-    model = get_arch(model_name, in_c=args.in_c, n_classes=n_classes)
+    arch_opts = get_arch_options(args)
+    model = get_arch(model_name, in_c=args.in_c, n_classes=n_classes, **arch_opts)
     model = model.to(device)
 
     print("Total params: {0:,}".format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
+    print('* Architecture summary: cross_stage_bridge={} scales={} init={} trainable_params={}'.format(
+        args.cross_stage_bridge, args.cross_stage_bridge_scales, args.cross_stage_bridge_init,
+        sum(p.numel() for p in model.parameters() if p.requires_grad)))
     optimizer = torch.optim.Adam(model.parameters(), lr=max_lr)
 
     ### TRAINING WITH PSEUDO-LABELS
