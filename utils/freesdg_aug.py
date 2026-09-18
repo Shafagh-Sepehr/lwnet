@@ -147,6 +147,17 @@ class FourierButterworthView:
         fmap = self.fmap.to(device=x01.device, dtype=x01.dtype)
         spec = torch.fft.fft2(x01) * fmap
         res = torch.abs(torch.fft.ifft2(spec))  # >= 0 by construction
+        # Fastest percentile path is chosen automatically: numpy on CPU (its
+        # O(n) partition beats torch.quantile's full sort), torch.quantile on
+        # CUDA (avoids a per-plane GPU->CPU synchronization).
+        if res.is_cuda:
+            out = self._percentile_vectorized(res)
+        else:
+            out = self._percentile_legacy(res)
+        return out * mask01.to(dtype=out.dtype)
+
+    @staticmethod
+    def _percentile_legacy(res):
         # official percentile normalization, per sample and channel
         out = torch.empty_like(res)
         for b in range(res.shape[0]):
@@ -159,7 +170,30 @@ class FourierButterworthView:
                 denom = hi - lo if hi > lo else 1e-8
                 out[b, c] = torch.from_numpy(
                     ((plane - lo) / denom).clip(0.0, 1.0))
-        return out * mask01.to(dtype=out.dtype)
+        return out
+
+    @staticmethod
+    def _percentile_vectorized(res):
+        # Vectorized equivalent of _percentile_legacy: per-sample/per-channel
+        # [3rd, 97th] percentile computed with torch.quantile (linear
+        # interpolation, matching np.percentile) on the 1/256-quantized copy,
+        # applied to the unquantized tensor. No .cpu().numpy() round-trip and
+        # no Python per-plane loop; runs on the tensor's own device.
+        #
+        # Used only by the 'cuda' backend, where a .cpu().numpy() round-trip
+        # would force a GPU->CPU synchronization per plane. On CPU this is
+        # *slower* than numpy's np.percentile (torch.quantile sorts the whole
+        # plane while np.percentile uses an O(n) partition), so both CPU
+        # backends keep the numpy path (see benchmark_freesdg.py).
+        b, c, h, w = res.shape
+        flat = res.reshape(b * c, h * w)
+        temp = torch.trunc(flat * 256) / 256.0
+        lo = torch.quantile(temp, RAFFE_PCTL / 100.0, dim=1)
+        hi = torch.quantile(temp, (100 - RAFFE_PCTL) / 100.0, dim=1)
+        denom = hi - lo
+        denom = torch.where(denom > 0, denom, torch.full_like(denom, 1e-8))
+        out = ((flat - lo.unsqueeze(1)) / denom.unsqueeze(1)).clamp(0.0, 1.0)
+        return out.reshape(b, c, h, w)
 
 
 class RaffeFilterBank:
@@ -178,8 +212,9 @@ class RaffeFilterBank:
     def views(self, height, width):
         key = (height, width)
         if key not in self._views:
-            self._views[key] = [FourierButterworthView(height, width, d0, n)
-                                for d0, n in self.params]
+            self._views[key] = [
+                FourierButterworthView(height, width, d0, n)
+                for d0, n in self.params]
         return self._views[key]
 
     def sample_indices(self, rng, channels=3):
@@ -190,6 +225,60 @@ class RaffeFilterBank:
         views = self.views(x01.shape[-2], x01.shape[-1])
         return torch.cat([views[indices[c]](x01[:, c:c + 1], mask01)
                           for c in range(x01.shape[1])], dim=1)
+
+
+# Bounded cache of integer coordinate grids for the direct mask calculation.
+# Keyed by (height, width, device, dtype); cleared when it grows too large so
+# a long-lived process cannot accumulate one grid per (size, device) pair.
+_COORD_CACHE = {}
+_COORD_CACHE_MAX = 64
+
+
+def _coord_grids(height, width, device=None, dtype=torch.int64):
+    key = (int(height), int(width), str(device), str(dtype))
+    grids = _COORD_CACHE.get(key)
+    if grids is None:
+        yy = torch.arange(height, dtype=dtype, device=device).view(-1, 1)
+        xx = torch.arange(width, dtype=dtype, device=device).view(1, -1)
+        grids = (yy, xx)
+        if len(_COORD_CACHE) >= _COORD_CACHE_MAX:
+            _COORD_CACHE.clear()
+        _COORD_CACHE[key] = grids
+    return grids
+
+
+def direct_smooth_mask(points, height, width, expansion_step,
+                       device=None, dtype=torch.float32):
+    """Direct Chebyshev-distance equivalent of ``DT2SmoothMask.generate``.
+
+    For binary point seeds and stride-1 5x5 max pooling with zero padding,
+    repeated dilation admits a closed form. After iteration ``t`` a pixel is
+    active iff its Chebyshev distance to the nearest seed ``d <= 2*t``, so the
+    number of contributions is ``count = clamp(T - max(1, ceil(d/2)) + 1,
+    0, T)`` and ``acc = step * count`` (plan §2). Integer distance arithmetic
+    keeps the count exact; only the final ``step * count`` and min-max
+    normalization are floating point, matching the reference's float32
+    accumulation to within ~1e-7 (repeated ``+= step`` vs a single multiply).
+
+    ``points`` is the same list of ``(row, col)`` seed coordinates the
+    iterative reference consumes, so duplicate and boundary seeds are
+    preserved exactly. ``expansion_step`` is the reference's ``T`` (100).
+    """
+    T = int(expansion_step)
+    yy, xx = _coord_grids(height, width, device=device)
+    d = None
+    for (r, c) in points:
+        dist = torch.maximum(torch.abs(yy - r), torch.abs(xx - c))
+        d = dist if d is None else torch.minimum(d, dist)
+    # integer ceil(d / 2) for d >= 0; seeds (d == 0) still enter at t == 1
+    t_enter = (d + 1) // 2
+    t_enter = torch.maximum(t_enter, torch.ones_like(t_enter))
+    count = torch.clamp(T - t_enter + 1, 0, T)
+    acc = (1.0 / T) * count.to(dtype)
+    lo, hi = acc.min(), acc.max()
+    if float(hi - lo) <= 0.0:
+        return torch.zeros_like(acc)
+    return (acc - lo) / (hi - lo)
 
 
 class DT2SmoothMask:
@@ -204,6 +293,11 @@ class DT2SmoothMask:
     mask: 5 centers, each randint(0, size-1) (official hardcodes 511 for
     512; generalized to the actual size here — documented adaptation).
     All randomness comes from the CALLER's dedicated RNG.
+
+    ``generate`` uses the direct Chebyshev-distance calculation (~300x
+    faster than the reference iterative max-pool expansion, mathematically
+    equivalent). The iterative reference is kept as ``_generate_iterative``
+    for parity tests.
     """
 
     def __init__(self, center_num=5, expansion_step=100):
@@ -211,11 +305,19 @@ class DT2SmoothMask:
         self.expansion_step = expansion_step
         self.max_pool = nn.MaxPool2d(kernel_size=5, stride=1, padding=2)
 
-    def generate(self, rng, height, width):
-        pts = [(rng.randint(0, height - 1), rng.randint(0, width - 1))
-               for _ in range(self.center_num)]
+    def sample_points(self, rng, height, width):
+        return [(rng.randint(0, height - 1), rng.randint(0, width - 1))
+                for _ in range(self.center_num)]
+
+    def generate(self, rng, height, width, points=None, device=None):
+        if points is None:
+            points = self.sample_points(rng, height, width)
+        return direct_smooth_mask(points, height, width,
+                                  self.expansion_step, device=device)
+
+    def _generate_iterative(self, points, height, width):
         seeds = torch.zeros(1, height, width)
-        for (r, c) in pts:
+        for (r, c) in points:
             seeds[0, r, c] = 1.0
         acc = torch.zeros(1, height, width)
         step = 1.0 / self.expansion_step
@@ -547,7 +649,7 @@ class FreeSDGAugmentor:
 
     def augment_train(self, img01, mask01, raw_prob=0.0, filter_idx=None,
                       raffe_indices_1=None, raffe_indices_2=None,
-                      blend_mask=None):
+                      blend_mask=None, blend_points=None):
         """Training-time augmentation with the configured aug_mode.
 
         Draw order (dedicated RNG, uniform across modes): raw/FMAug coin
@@ -560,8 +662,10 @@ class FreeSDGAugmentor:
             indices, then 5 DT2 blend-mask centers
 
         The optional hook arguments are deterministic test hooks only
-        (filter_idx for random_hfc, raffe_indices_*/blend_mask for the
-        raffe modes); production code never passes them.
+        (filter_idx for random_hfc, raffe_indices_*/blend_mask/blend_points
+        for the raffe modes); production code never passes them. ``blend_points``
+        injects the DT2 seed coordinates so the iterative and direct mask
+        implementations can be compared on identical seeds (plan §5/§6.1).
         """
         with torch.no_grad():
             # Raw/FMAug probability comes from the dedicated RNG (§6.2).
@@ -596,7 +700,8 @@ class FreeSDGAugmentor:
                     raffe_indices_2 = self.raffe_bank.sample_indices(
                         self.rng, channels=x.shape[1])
                 if blend_mask is None:
-                    blend_mask = self.raffe_smooth.generate(self.rng, h, w)
+                    blend_mask = self.raffe_smooth.generate(
+                        self.rng, h, w, points=blend_points, device=x.device)
                 v1 = self.raffe_bank.apply(x, m, raffe_indices_1)
                 v2 = self.raffe_bank.apply(x, m, raffe_indices_2)
                 bm = blend_mask.to(device=x.device, dtype=x.dtype)
