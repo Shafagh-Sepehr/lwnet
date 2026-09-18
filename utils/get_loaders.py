@@ -40,6 +40,7 @@ class TrainDataset(Dataset):
         self._freesdg_augmentor = None
         self._freesdg_augmentor_args = None
         self._freesdg_mask_resize = None
+        self._freesdg_last_raffe_device = None
 
     def _freesdg_enabled(self):
         return self.freesdg_cfg is not None and self.freesdg_cfg.get('enabled', False)
@@ -108,8 +109,21 @@ class TrainDataset(Dataset):
             img, target = self.freesdg_resize(img, target)
             img01 = tvtF.to_tensor(img)
             mask01 = self._freesdg_mask_tensor(mask, tuple(img01.shape[-2:]))
+            # Raffe is intentionally executed per sample before the existing
+            # PIL/LwNet transforms.  Keep all other FreeSDG modes on their
+            # original CPU path and return to CPU for the required PIL bridge.
+            raffe_mode = self.freesdg_cfg.get('aug_mode') in (
+                'raffe_filter', 'raffe_smooth_mix')
+            raffe_device = torch.device(
+                self.freesdg_cfg.get('device', 'cpu')) if raffe_mode else None
+            if raffe_device is not None and raffe_device.type == 'cuda':
+                img01 = img01.to(raffe_device)
+                mask01 = mask01.to(raffe_device)
             img01 = augmentor.augment_train(
                 img01, mask01, raw_prob=self.freesdg_cfg.get('raw_prob', 0.0))
+            if raffe_device is not None:
+                self._freesdg_last_raffe_device = img01.device
+                img01 = img01.cpu()
             img = augmentor.to_pil_uint8(img01)
             if self.transforms is not None:
                 img, target = self.transforms(img, target)

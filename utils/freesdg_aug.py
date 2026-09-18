@@ -144,6 +144,7 @@ class FourierButterworthView:
         # reused for every sample, so avoiding a host-to-device map copy on
         # every call matters for the CUDA path.  The map values are unchanged.
         self._fmap_cache = {}
+        self.last_device = None
 
     def __call__(self, x01, mask01):
         if x01.dim() != 4:
@@ -153,6 +154,7 @@ class FourierButterworthView:
         if fmap is None:
             fmap = self.fmap.to(device=x01.device, dtype=x01.dtype)
             self._fmap_cache[cache_key] = fmap
+        self.last_device = x01.device
         spec = torch.fft.fft2(x01) * fmap
         res = torch.abs(torch.fft.ifft2(spec))  # >= 0 by construction
         # Fastest percentile path is chosen automatically: numpy on CPU (its

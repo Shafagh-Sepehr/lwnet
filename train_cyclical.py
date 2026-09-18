@@ -286,18 +286,16 @@ if __name__ == '__main__':
             'seed': args.freesdg_seed,
             'aug_mode': args.freesdg_aug_mode,
             'lwnet_aug_profile': args.freesdg_lwnet_aug_profile,
+            'device': args.device,
         }
     else:
         freesdg_cfg = None
 
     if args.device.startswith("cuda"):
-        # In case one has multiple devices, we must first set the one
-        # we would like to use so pytorch can find it.
-        os.environ['CUDA_VISIBLE_DEVICES'] = args.device.split(":",1)[1]
         if not torch.cuda.is_available():
             raise RuntimeError("cuda is not currently available!")
-        print('* Training on device '.format(args.device))
-        device = torch.device("cuda")
+        print('* Training on device {}'.format(args.device))
+        device = torch.device(args.device)
     else:  #cpu
         device = torch.device(args.device)
 
