@@ -1,4 +1,4 @@
-import sys, json, os, argparse, copy, random
+import sys, json, os, argparse, copy, random, shutil
 from shutil import copyfile, rmtree
 import os.path as osp
 from datetime import datetime
@@ -337,6 +337,7 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
         train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle,
                         checkpoint_interval=checkpoint_interval, epoch_callback=callback)
         completed_epochs += scheduler.cycle_lens[cycle]
+        print('-' * shutil.get_terminal_size(fallback=(80, 24)).columns)
 
     del model
     torch.cuda.empty_cache()
