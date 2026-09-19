@@ -675,7 +675,7 @@ class FreeSDGAugmentor:
 
     def augment_train(self, img01, mask01, raw_prob=0.0, filter_idx=None,
                       raffe_indices_1=None, raffe_indices_2=None,
-                      blend_mask=None, blend_points=None):
+                      blend_mask=None, blend_points=None, return_branch=False):
         """Training-time augmentation with the configured aug_mode.
 
         Draw order (dedicated RNG, uniform across modes): raw/FMAug coin
@@ -691,12 +691,17 @@ class FreeSDGAugmentor:
         (filter_idx for random_hfc, raffe_indices_*/blend_mask/blend_points
         for the raffe modes); production code never passes them. ``blend_points``
         injects the DT2 seed coordinates so the iterative and direct mask
-        implementations can be compared on identical seeds (plan §5/§6.1).
+         implementations can be compared on identical seeds (plan §5/§6.1).
+        With ``return_branch=True``, result includes branch ``'raw'`` or
+        ``'augmented'``.
         """
+        def _result(image, branch):
+            return (image, branch) if return_branch else image
+
         with torch.no_grad():
             # Raw/FMAug probability comes from the dedicated RNG (§6.2).
             if self.rng.random() < raw_prob:
-                return img01
+                return _result(img01, 'raw')
             x, m, squeeze = self._as_batch(img01, mask01)
             m = m.to(dtype=x.dtype)
             if self.aug_mode == "fmaug":
@@ -734,7 +739,8 @@ class FreeSDGAugmentor:
                 bm = bm.view(1, 1, h, w)
                 y01 = bm * v1 + (1.0 - bm) * v2
                 y01 = y01.clamp(0.0, 1.0) * m
-            return y01.squeeze(0) if squeeze else y01
+            output = y01.squeeze(0) if squeeze else y01
+            return _result(output, 'augmented')
 
     def anchor(self, img01, mask01):
         """Fixed-anchor HFC preprocessing for evaluation (plan §1.6/§7)."""

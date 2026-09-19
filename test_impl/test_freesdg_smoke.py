@@ -19,7 +19,10 @@ import traceback
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR = os.path.dirname(_TEST_DIR)
+sys.path.insert(0, _ROOT_DIR)
+sys.path.insert(1, _TEST_DIR)
 
 from utils.freesdg_aug import (  # noqa: E402
     FREESDG_FILTER_BANK,
@@ -523,8 +526,7 @@ def test_20_11_checkpoint_roundtrip():
 def test_20_12_config():
     import importlib.util
     spec = importlib.util.spec_from_file_location(
-        "train_cyclical_for_test", os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "train_cyclical.py"))
+        "train_cyclical_for_test", os.path.join(_ROOT_DIR, "train_cyclical.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     defaults = vars(mod.parser.parse_args([]))
@@ -543,8 +545,17 @@ def test_20_12_config():
     }
     for key, value in expected.items():
         assert defaults.get(key, "<missing>") == value, key
+    enabled = mod.parser.parse_args([
+        '--freesdg', '--freesdg_disable_aug_color_jitter'])
+    assert enabled.freesdg_disable_aug_color_jitter is True
     # training writes json.dump(vars(args)) -> all keys serialize
     json.dumps(defaults)
+    with tempfile.TemporaryDirectory() as tmp:
+        config_path = os.path.join(tmp, 'config.cfg')
+        mod.write_training_config(enabled, config_path)
+        with open(config_path) as f:
+            saved = json.load(f)
+        assert saved['freesdg_disable_aug_color_jitter'] is True
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +727,31 @@ def test_diag_profiles_and_rawprob():
     names = [type(t).__name__ for t in tr_v.transforms.transforms]
     assert names == ['Resize', 'RandomChoice', 'ColorJitter',
                      'RandomHorizontalFlip', 'RandomVerticalFlip', 'ToTensor']
+
+    # Structural-saliency replay must use selected branch pipeline.
+    tr_struct, _ = get_train_val_datasets(
+        csv_path, csv_path, tg_size=(64, 64),
+        freesdg_cfg=dict(base_cfg, disable_aug_color_jitter=True),
+        need_structural_saliency=True)
+    structural_sample = tr_struct[0]
+    assert len(structural_sample) == 4
+
+    # Omitted and explicit False preserve identical dataset behavior.
+    cfg_legacy = dict(base_cfg)
+    cfg_false = dict(base_cfg, disable_aug_color_jitter=False)
+    tr_legacy, _ = get_train_val_datasets(csv_path, csv_path,
+                                          tg_size=(64, 64),
+                                          freesdg_cfg=cfg_legacy)
+    tr_false, _ = get_train_val_datasets(csv_path, csv_path,
+                                         tg_size=(64, 64),
+                                         freesdg_cfg=cfg_false)
+    random.seed(123)
+    torch.manual_seed(123)
+    legacy_sample = tr_legacy[0]
+    random.seed(123)
+    torch.manual_seed(123)
+    false_sample = tr_false[0]
+    assert all(torch.equal(a, b) for a, b in zip(legacy_sample, false_sample))
 
     # raw_prob behavior: 0 -> never raw, 1 -> always raw, 0.5 deterministic
     img, mask = make_img_mask(batch=1, channels=3, height=64, width=64,

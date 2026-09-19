@@ -58,6 +58,8 @@ class TrainDataset(Dataset):
         # the original code path below executes verbatim.
         self.freesdg_cfg = freesdg_cfg
         self.freesdg_resize = None  # hoisted deterministic resize (set by get_train_val_datasets)
+        self.freesdg_raw_transforms = None
+        self.freesdg_augmented_transforms = None
         self._freesdg_augmentor = None
         self._freesdg_augmentor_args = None
         self._freesdg_mask_resize = None
@@ -96,16 +98,18 @@ class TrainDataset(Dataset):
         return tvtF.to_tensor(self._freesdg_mask_pil(mask, hw))
 
     def _apply_transforms_with_structural_reference(
-            self, network_img, segmentation_target, structural_raw_img, structural_fov_mask):
+            self, network_img, segmentation_target, structural_raw_img,
+            structural_fov_mask, transforms=None):
         # Replay the exact same random transform realization on the raw RGB
         # reference and its FOV mask (plan §13). The second transform call must
         # not advance the global RNG permanently.
         before = _capture_transform_rng_state()
-        network_img_t, segmentation_t = self.transforms(network_img, segmentation_target)
+        transforms = transforms or self.transforms
+        network_img_t, segmentation_t = transforms(network_img, segmentation_target)
         after = _capture_transform_rng_state()
         _restore_transform_rng_state(before)
         try:
-            structural_ref_t, structural_mask_t = self.transforms(
+            structural_ref_t, structural_mask_t = transforms(
                 structural_raw_img, structural_fov_mask)
         finally:
             _restore_transform_rng_state(after)
@@ -166,19 +170,36 @@ class TrainDataset(Dataset):
             if raffe_device is not None and raffe_device.type == 'cuda':
                 img01 = img01.to(raffe_device)
                 mask01 = mask01.to(raffe_device)
-            img01 = augmentor.augment_train(
-                img01, mask01, raw_prob=self.freesdg_cfg.get('raw_prob', 0.0))
+            disable_color_jitter = self.freesdg_cfg.get(
+                'disable_aug_color_jitter', False)
+            if disable_color_jitter:
+                img01, branch = augmentor.augment_train(
+                    img01, mask01, raw_prob=self.freesdg_cfg.get('raw_prob', 0.0),
+                    return_branch=True)
+            else:
+                img01 = augmentor.augment_train(
+                    img01, mask01, raw_prob=self.freesdg_cfg.get('raw_prob', 0.0))
+                branch = None
             if raffe_device is not None:
                 self._freesdg_last_raffe_device = img01.device
                 img01 = img01.cpu()
             img = augmentor.to_pil_uint8(img01)
             if self.transforms is not None:
+                selected_transforms = self.transforms
+                if disable_color_jitter:
+                    if branch == 'raw':
+                        selected_transforms = self.freesdg_raw_transforms
+                    elif branch == 'augmented':
+                        selected_transforms = self.freesdg_augmented_transforms
+                    else:
+                        raise RuntimeError('unexpected FreeSDG branch: {!r}'.format(branch))
                 if self.need_structural_saliency:
                     img, target, structural_ref, structural_mask = \
                         self._apply_transforms_with_structural_reference(
-                            img, target, structural_raw_img, structural_fov_mask)
+                            img, target, structural_raw_img, structural_fov_mask,
+                            transforms=selected_transforms)
                 else:
-                    img, target = self.transforms(img, target)
+                    img, target = selected_transforms(img, target)
         elif self._freesdg_enabled() and self.freesdg_cfg.get('role') == 'val' \
                 and self.freesdg_cfg.get('test_input', 'raw') == 'anchor':
             # Validation anchor path (plan §7/§10.2): deterministic Resize +
@@ -343,6 +364,13 @@ def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), lab
         else:
             train_transforms = p_tr.Compose([scale_transl_rot, jitter, h_flip, v_flip, tensorizer])
         train_dataset.freesdg_resize = resize
+        if (freesdg_cfg.get('lwnet_aug_profile', 'original') == 'original'
+                and freesdg_cfg.get('disable_aug_color_jitter', False)):
+            train_dataset.freesdg_raw_transforms = p_tr.Compose([
+                scale_transl_rot, jitter, h_flip, v_flip, tensorizer])
+            train_dataset.freesdg_augmented_transforms = p_tr.Compose([
+                scale_transl_rot, h_flip, v_flip, tensorizer])
+            train_transforms = train_dataset.freesdg_raw_transforms
     else:
         train_transforms = p_tr.Compose([resize,  scale_transl_rot, jitter, h_flip, v_flip, tensorizer])
     val_transforms = p_tr.Compose([resize, tensorizer])

@@ -24,7 +24,10 @@ import traceback
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR = os.path.dirname(_TEST_DIR)
+sys.path.insert(0, _ROOT_DIR)
+sys.path.insert(1, _TEST_DIR)
 
 from utils.freesdg_aug import (  # noqa: E402
     DT2SmoothMask,
@@ -280,8 +283,7 @@ def test_cuda_placement():
 def test_config_flags():
     import importlib.util
     spec = importlib.util.spec_from_file_location(
-        "train_cyclical_for_test", os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "train_cyclical.py"))
+        "train_cyclical_for_test", os.path.join(_ROOT_DIR, "train_cyclical.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     defaults = vars(mod.parser.parse_args([]))

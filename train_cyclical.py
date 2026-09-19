@@ -63,6 +63,11 @@ parser.add_argument('--freesdg_seed', type=int, default=0, help='dedicated seed 
 # Diagnostic-stage selectors (defaults preserve existing behavior)
 parser.add_argument('--freesdg_aug_mode', type=str, default='fmaug', choices=['fmaug', 'fixed_hfc', 'random_hfc', 'raffe_filter', 'raffe_smooth_mix'], help='training augmentation mode: full FreeSDG FMAug, deterministic fixed anchor HFC, single random bank HFC view, official RaffeSDG random frequency filtering, or RaffeSDG smooth blending')
 parser.add_argument('--freesdg_lwnet_aug_profile', type=str, default='original', choices=['original', 'flips_only'], help='LwNet augmentation applied after the frequency transform: original pipeline or flips only (diagnostic)')
+parser.add_argument(
+    '--freesdg_disable_aug_color_jitter', action='store_true',
+    help=('disable post-frequency ColorJitter only for non-raw '
+          'FreeSDG/RAFFE training samples; raw samples retain the full '
+          'original LwNet augmentation pipeline'))
 # RaffeSDG-derived structural-saliency self-supervision (plan §2)
 parser.add_argument('--structural_saliency', action='store_true', help='enable RaffeSDG-derived structural-saliency self-supervision')
 parser.add_argument('--structural_saliency_weight', type=float, default=1.0, help='weight of the structural-saliency reconstruction MSE')
@@ -76,6 +81,22 @@ parser.add_argument('--loss_dice_weight', type=float, default=0.0, help='weight 
 parser.add_argument('--loss_cldice_weight', type=float, default=0.0, help='weight of the foreground soft-clDice topology term')
 parser.add_argument('--loss_boundary_weight', type=float, default=0.0, help='weight of the signed-distance boundary term (distances in pixels: resolution/scale dependent, pilot at 0.01)')
 parser.add_argument('--loss_cldice_iters', type=int, default=10, help='soft-skeleton erosion iterations for the clDice term')
+
+
+def validate_freesdg_args(args):
+    if args.freesdg_disable_aug_color_jitter and not args.freesdg:
+        parser.error('--freesdg_disable_aug_color_jitter requires --freesdg')
+    if (args.freesdg_disable_aug_color_jitter
+            and args.freesdg_lwnet_aug_profile == 'flips_only'):
+        parser.error('--freesdg_disable_aug_color_jitter cannot combine with '
+                     '--freesdg_lwnet_aug_profile flips_only')
+
+
+def write_training_config(args, config_file_path):
+    with open(config_file_path, 'w') as f:
+        json.dump(vars(args), f, indent=2)
+
+
 # Zero-initialized gated cross-stage decoder bridges (A1)
 parser.add_argument('--cross_stage_bridge', choices=['none', 'scalar', 'channel'], default='none',
                     help='U1-decoder to U2-decoder gated residual bridge type')
@@ -429,6 +450,7 @@ if __name__ == '__main__':
     args.resolved_metric_tolerances = selection_policy['metric_tolerances']
 
     # FreeSDG FMAug argument validation (plan §11)
+    validate_freesdg_args(args)
     if args.freesdg:
         if not (0.0 <= args.freesdg_raw_prob <= 1.0):
             sys.exit('--freesdg_raw_prob must be within [0, 1]')
@@ -463,10 +485,15 @@ if __name__ == '__main__':
             'seed': args.freesdg_seed,
             'aug_mode': args.freesdg_aug_mode,
             'lwnet_aug_profile': args.freesdg_lwnet_aug_profile,
+            'disable_aug_color_jitter': args.freesdg_disable_aug_color_jitter,
             'device': args.device,
         }
     else:
         freesdg_cfg = None
+
+    if args.freesdg_disable_aug_color_jitter:
+        print('* FreeSDG post-frequency transforms: raw=original, '
+              'augmented=original_without_color_jitter')
 
     if args.device.startswith("cuda"):
         if not torch.cuda.is_available():
@@ -508,8 +535,7 @@ if __name__ == '__main__':
         os.makedirs(experiment_path, exist_ok=True)
 
         config_file_path = osp.join(experiment_path,'config.cfg')
-        with open(config_file_path, 'w') as f:
-            json.dump(vars(args), f, indent=2)
+        write_training_config(args, config_file_path)
     else: experiment_path=None
 
     csv_train = args.csv_train
