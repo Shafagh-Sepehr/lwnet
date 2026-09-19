@@ -4,6 +4,7 @@ from . import paired_transforms_tv04 as p_tr
 
 import os
 import os.path as osp
+import random
 import pandas as pd
 from PIL import Image
 import numpy as np
@@ -18,9 +19,24 @@ from .freesdg_aug import FreeSDGAugmentor
 # SciPy stays lazy inside signed_distance_map for boundary preparation).
 from segmentation_losses import signed_distance_map, check_binary_labels
 
+
+def _capture_transform_rng_state():
+    return {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+    }
+
+
+def _restore_transform_rng_state(state):
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch'])
+
+
 class TrainDataset(Dataset):
     def __init__(self, csv_path, transforms=None, label_values=None, freesdg_cfg=None,
-                 need_distance_map=False):
+                 need_distance_map=False, need_structural_saliency=False):
         df = pd.read_csv(csv_path)
         self.im_list = df.im_paths
         self.gt_list = df.gt_paths
@@ -33,6 +49,11 @@ class TrainDataset(Dataset):
         # at the supervised output resolution). Derived only from
         # loss_boundary_weight > 0; never from --freesdg.
         self.need_distance_map = need_distance_map
+        # Structural-saliency self-supervision (plan §19): when True, each
+        # training sample additionally returns a geometrically synchronized
+        # raw RGB reference and its FOV mask. Training-only; never set for
+        # validation.
+        self.need_structural_saliency = need_structural_saliency
         # Opt-in FreeSDG FMAug configuration (plan §10). None/disabled ->
         # the original code path below executes verbatim.
         self.freesdg_cfg = freesdg_cfg
@@ -63,13 +84,32 @@ class TrainDataset(Dataset):
                 aug_mode=args[6])
         return self._freesdg_augmentor
 
-    def _freesdg_mask_tensor(self, mask, hw):
+    def _freesdg_mask_pil(self, mask, hw):
         # NEAREST resize keeps the FOV mask binary (plan §10.1/§15)
         if self._freesdg_mask_resize is None:
             self._freesdg_mask_resize = p_tr.Resize(hw, interpolation=InterpolationMode.NEAREST)
         elif self._freesdg_mask_resize.size != hw:
             self._freesdg_mask_resize = p_tr.Resize(hw, interpolation=InterpolationMode.NEAREST)
-        return tvtF.to_tensor(self._freesdg_mask_resize(mask))
+        return self._freesdg_mask_resize(mask)
+
+    def _freesdg_mask_tensor(self, mask, hw):
+        return tvtF.to_tensor(self._freesdg_mask_pil(mask, hw))
+
+    def _apply_transforms_with_structural_reference(
+            self, network_img, segmentation_target, structural_raw_img, structural_fov_mask):
+        # Replay the exact same random transform realization on the raw RGB
+        # reference and its FOV mask (plan §13). The second transform call must
+        # not advance the global RNG permanently.
+        before = _capture_transform_rng_state()
+        network_img_t, segmentation_t = self.transforms(network_img, segmentation_target)
+        after = _capture_transform_rng_state()
+        _restore_transform_rng_state(before)
+        try:
+            structural_ref_t, structural_mask_t = self.transforms(
+                structural_raw_img, structural_fov_mask)
+        finally:
+            _restore_transform_rng_state(after)
+        return network_img_t, segmentation_t, structural_ref_t, structural_mask_t
 
     def label_encoding(self, gdt):
         gdt_gray = np.array(gdt.convert('L'))
@@ -100,6 +140,9 @@ class TrainDataset(Dataset):
         target[np.array(mask) == 0] = 0
         target = Image.fromarray(target)
 
+        structural_ref = None
+        structural_mask = None
+
         if self._freesdg_enabled() and self.freesdg_cfg.get('role', 'train') == 'train':
             # FMAug training path (plan §1.4/§10.1): hoisted deterministic
             # resize of image+target, NEAREST-resized FOV mask, FMAug on the
@@ -107,8 +150,12 @@ class TrainDataset(Dataset):
             # then exactly the remaining original transform order.
             augmentor = self._get_freesdg_augmentor()
             img, target = self.freesdg_resize(img, target)
+            if self.need_structural_saliency:
+                structural_raw_img = img.copy()
             img01 = tvtF.to_tensor(img)
             mask01 = self._freesdg_mask_tensor(mask, tuple(img01.shape[-2:]))
+            if self.need_structural_saliency:
+                structural_fov_mask = self._freesdg_mask_pil(mask, tuple(img01.shape[-2:]))
             # Raffe is intentionally executed per sample before the existing
             # PIL/LwNet transforms.  Keep all other FreeSDG modes on their
             # original CPU path and return to CPU for the required PIL bridge.
@@ -126,7 +173,12 @@ class TrainDataset(Dataset):
                 img01 = img01.cpu()
             img = augmentor.to_pil_uint8(img01)
             if self.transforms is not None:
-                img, target = self.transforms(img, target)
+                if self.need_structural_saliency:
+                    img, target, structural_ref, structural_mask = \
+                        self._apply_transforms_with_structural_reference(
+                            img, target, structural_raw_img, structural_fov_mask)
+                else:
+                    img, target = self.transforms(img, target)
         elif self._freesdg_enabled() and self.freesdg_cfg.get('role') == 'val' \
                 and self.freesdg_cfg.get('test_input', 'raw') == 'anchor':
             # Validation anchor path (plan §7/§10.2): deterministic Resize +
@@ -137,7 +189,14 @@ class TrainDataset(Dataset):
             mask01 = self._freesdg_mask_tensor(mask, tuple(img.shape[-2:]))
             img = augmentor.anchor(img, mask01)
         elif self.transforms is not None:
-            img, target = self.transforms(img, target)
+            if self.need_structural_saliency:
+                structural_raw_img = img.copy()
+                structural_fov_mask = mask.copy()
+                img, target, structural_ref, structural_mask = \
+                    self._apply_transforms_with_structural_reference(
+                        img, target, structural_raw_img, structural_fov_mask)
+            else:
+                img, target = self.transforms(img, target)
 
 
         # QUICK HACK FOR PSEUDO_SEG IN VESSELS, BUT IT SPOILS A/V
@@ -145,6 +204,9 @@ class TrainDataset(Dataset):
             target = target.float()
             if torch.max(target) >1:
                 target= target.float()/255
+
+        if structural_ref is not None:
+            structural_mask = (structural_mask > 0).float().unsqueeze(0)
 
         # Optional boundary-loss supervision metadata: the signed-distance map
         # is recomputed from the final (post-augmentation) label here on CPU
@@ -155,7 +217,12 @@ class TrainDataset(Dataset):
         if self.need_distance_map:
             check_binary_labels(target)
             dist_map = signed_distance_map(target.unsqueeze(0))  # [1, H, W]
+            if self.need_structural_saliency:
+                return img, target, dist_map, structural_ref, structural_mask
             return img, target, dist_map
+
+        if self.need_structural_saliency:
+            return img, target, structural_ref, structural_mask
 
         return img, target
 
@@ -237,17 +304,17 @@ def build_pseudo_dataset(train_csv_path, test_csv_path, path_to_preds):
     return train_im_list, train_gt_list, train_mask_list
 
 
-def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), label_values=(0, 255), freesdg_cfg=None, need_distance_map=False):
+def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), label_values=(0, 255), freesdg_cfg=None, need_distance_map=False, need_structural_saliency=False):
 
     freesdg_enabled = freesdg_cfg is not None and freesdg_cfg.get('enabled', False)
     if freesdg_enabled:
         train_freesdg_cfg = dict(freesdg_cfg, role='train')
         val_freesdg_cfg = dict(freesdg_cfg, role='val')
-        train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values, freesdg_cfg=train_freesdg_cfg, need_distance_map=need_distance_map)
-        val_dataset = TrainDataset(csv_path=csv_path_val, label_values=label_values, freesdg_cfg=val_freesdg_cfg, need_distance_map=need_distance_map)
+        train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values, freesdg_cfg=train_freesdg_cfg, need_distance_map=need_distance_map, need_structural_saliency=need_structural_saliency)
+        val_dataset = TrainDataset(csv_path=csv_path_val, label_values=label_values, freesdg_cfg=val_freesdg_cfg, need_distance_map=need_distance_map, need_structural_saliency=False)
     else:
-        train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values, need_distance_map=need_distance_map)
-        val_dataset = TrainDataset(csv_path=csv_path_val, label_values=label_values, need_distance_map=need_distance_map)
+        train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values, need_distance_map=need_distance_map, need_structural_saliency=need_structural_saliency)
+        val_dataset = TrainDataset(csv_path=csv_path_val, label_values=label_values, need_distance_map=need_distance_map, need_structural_saliency=False)
     # transforms definition
     # required transforms
     resize = p_tr.Resize(tg_size)
@@ -284,10 +351,11 @@ def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), lab
 
     return train_dataset, val_dataset
 
-def get_train_val_loaders(csv_path_train, csv_path_val, batch_size=4, tg_size=(512, 512), label_values=(0, 255), num_workers=0, freesdg_cfg=None, need_distance_map=False):
+def get_train_val_loaders(csv_path_train, csv_path_val, batch_size=4, tg_size=(512, 512), label_values=(0, 255), num_workers=0, freesdg_cfg=None, need_distance_map=False, need_structural_saliency=False):
     # need_distance_map is the generic boundary-loss requirement; it is applied
     # to the validation loader as well because validation loss is calculated.
-    train_dataset, val_dataset = get_train_val_datasets(csv_path_train, csv_path_val, tg_size=tg_size, label_values=label_values, freesdg_cfg=freesdg_cfg, need_distance_map=need_distance_map)
+    # need_structural_saliency is training-only and is forced off for validation.
+    train_dataset, val_dataset = get_train_val_datasets(csv_path_train, csv_path_val, tg_size=tg_size, label_values=label_values, freesdg_cfg=freesdg_cfg, need_distance_map=need_distance_map, need_structural_saliency=need_structural_saliency)
 
     train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available(), shuffle=True)
     val_loader = DataLoader(dataset=val_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())

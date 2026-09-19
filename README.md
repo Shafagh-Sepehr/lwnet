@@ -73,8 +73,9 @@ These are used only for training.
 ## 2. Training a W-Net for vessel segmentation
 Train a model on a given dataset. You also need to supply the path to save the model.
 Note that the training defaults to using the CPU, which is feasible due to the small size of our models.
-Checkpoint validation runs at cycle boundaries by default. Use `--checkpoint_interval epoch` for
-epoch-level checks. `--metric` accepts an ordered list such as `auc,dice,loss`; multi-metric
+Checkpoint validation runs at cycle boundaries by default. Use `--epoch_checkpointing_from N` to
+start epoch-level checks at cycle N (use `0` to keep cycle-level checks throughout). `--metric`
+accepts an ordered list such as `auc,dice,loss`; multi-metric
 policies use absolute near-tie tolerances (`auc=0.0005`, `dice=0.0001`, `loss=0.000001`) unless
 overridden with `--metric_tolerances`. A single metric remains strict unless an explicit tolerance
 is supplied. Comparisons are pairwise against the last selected checkpoint, so approximate equality
@@ -299,3 +300,39 @@ python predict_one_image_av.py --model_path experiments/big_wnet_hrf_av_1024/
                                --im_size 1024
 ```
 Using this model should result in finer arteries and veins delineations (although not necessarily more accuracy), which may be desirable if your data is of higher resolution than DRIVE.
+
+## Structural-Saliency Self-Supervision
+
+LwNet supports an optional auxiliary **structural-saliency self-supervision** task,
+inspired by the RaffeSDG structural-saliency pretext task. It is **not** the full
+RaffeSDG coupling architecture: no attention coupling is implemented.
+
+During training, the network receives the (frequency-)augmented image, while a
+Gaussian high-frequency-content (HFC) target is constructed from the
+geometrically aligned **original** (non-frequency-augmented) RGB image. An
+auxiliary decoder branching from U-Net 1's encoder reconstructs that target, and
+the reconstruction is supervised with a plain mean-squared error:
+
+`
+L = Lseg(U1) + Lseg(U2) + lambda_sal * Lmse
+`
+
+Key properties:
+
+1. the auxiliary decoder branches from U-Net 1's encoder and shares its
+   bottleneck and skip features;
+2. the structural target is a three-channel Gaussian HFC representation of the
+   aligned original image (range [-1, +1], exactly -1 outside the FOV);
+3. reconstruction uses 	orch.nn.functional.mse_loss (reduction='mean');
+4. the auxiliary decoder executes **only during training** (never during
+   validation or inference);
+5. the decoder's parameters remain in the saved checkpoint, so inference must
+   reconstruct the architecture from the saved config (handled automatically by
+   get_arch_options/get_arch);
+6. prediction output is still U-Net 2's vessel logits only.
+
+Enable it with --structural_saliency (weight --structural_saliency_weight,
+default 1.0; Gaussian kernel --structural_saliency_kernel/--structural_saliency_sigma,
+defaults 27/9.0; HFC ratio --structural_saliency_ratio, default 4.0). It works
+with or without --freesdg, and with every supported augmentation mode, so the
+ablation RAFFE vs RAFFE + structural saliency is directly comparable.

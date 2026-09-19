@@ -6,13 +6,15 @@ import operator
 from tqdm import tqdm
 import numpy as np
 import torch
-from models.get_model import get_arch, get_arch_options, validate_cross_stage_bridge
+import torch.nn.functional as F
+from models.get_model import get_arch, get_arch_options, validate_cross_stage_bridge, validate_structural_saliency
 
 from utils.get_loaders import get_train_val_loaders
 from utils.evaluation import evaluate, ewma
 from utils.model_saving_loading import save_model, str2bool, load_model
 from utils.reproducibility import set_seeds
 from utils.checkpoint_selection import parse_metric_policy, compare_checkpoint
+from utils.structural_saliency import StructuralSaliencyTarget
 
 from segmentation_losses import build_segmentation_loss
 
@@ -61,6 +63,12 @@ parser.add_argument('--freesdg_seed', type=int, default=0, help='dedicated seed 
 # Diagnostic-stage selectors (defaults preserve existing behavior)
 parser.add_argument('--freesdg_aug_mode', type=str, default='fmaug', choices=['fmaug', 'fixed_hfc', 'random_hfc', 'raffe_filter', 'raffe_smooth_mix'], help='training augmentation mode: full FreeSDG FMAug, deterministic fixed anchor HFC, single random bank HFC view, official RaffeSDG random frequency filtering, or RaffeSDG smooth blending')
 parser.add_argument('--freesdg_lwnet_aug_profile', type=str, default='original', choices=['original', 'flips_only'], help='LwNet augmentation applied after the frequency transform: original pipeline or flips only (diagnostic)')
+# RaffeSDG-derived structural-saliency self-supervision (plan §2)
+parser.add_argument('--structural_saliency', action='store_true', help='enable RaffeSDG-derived structural-saliency self-supervision')
+parser.add_argument('--structural_saliency_weight', type=float, default=1.0, help='weight of the structural-saliency reconstruction MSE')
+parser.add_argument('--structural_saliency_kernel', type=int, default=27, help='Gaussian kernel width used to construct the structural-saliency target')
+parser.add_argument('--structural_saliency_sigma', type=float, default=9.0, help='Gaussian sigma used to construct the structural-saliency target')
+parser.add_argument('--structural_saliency_ratio', type=float, default=4.0, help='amplification factor applied to the Gaussian high-frequency residual')
 # Composable segmentation losses (independent of FreeSDG/augmentation):
 # total = w_bce*bce + w_dice*dice + w_cldice*cldice + w_boundary*boundary
 parser.add_argument('--loss_bce_weight', type=float, default=1.0, help='weight of the BCE term (the existing baseline term)')
@@ -106,10 +114,12 @@ def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
 
-def format_loss_components(split, comps, criterion):
+def format_loss_components(split, comps, criterion, extra_weights=None):
     # One line of unweighted values, CLI weights, and weighted contributions;
     # disabled terms are simply absent from comps.
-    weights = getattr(criterion, 'weights', {})
+    weights = dict(getattr(criterion, 'weights', {}))
+    if extra_weights:
+        weights.update(extra_weights)
     parts = []
     for name, value in comps.items():
         w = weights.get(name)
@@ -136,7 +146,8 @@ def format_metric_transition(previous, candidate):
     return template.format(float(previous)), template.format(float(candidate))
 
 def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
-        grad_acc_steps=0, assess=False):
+        grad_acc_steps=0, assess=False, structural_target_builder=None,
+        structural_saliency_weight=0.0):
     device='cuda' if next(model.parameters()).is_cuda else 'cpu'
     train = optimizer is not None  # if we are in training mode there will be an optimizer and train=True here
 
@@ -154,16 +165,40 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
     comp_running = {}
 
     for i_batch, batch in enumerate(loader):
-        inputs, labels = batch[0], batch[1]
-        # Optional distance maps collated with the labels (boundary loss only).
-        distance_maps = batch[2] if len(batch) > 2 else None
-        inputs, labels = inputs.to(device), labels.to(device)
+        inputs = batch[0]
+        labels = batch[1]
+        offset = 2
+        distance_maps = None
+        structural_reference = None
+        structural_mask = None
+        if getattr(criterion, 'need_distance_map', False):
+            distance_maps = batch[offset]
+            offset += 1
+        if train and structural_target_builder is not None:
+            structural_reference = batch[offset]
+            structural_mask = batch[offset + 1]
+            offset += 2
+        if offset != len(batch):
+            raise RuntimeError('unexpected batch length {} (expected {})'.format(len(batch), offset))
+
+        inputs = inputs.to(device)
+        labels = labels.to(device)
         if distance_maps is not None:
             distance_maps = distance_maps.to(device)
+        if structural_reference is not None:
+            structural_reference = structural_reference.to(device)
+            structural_mask = structural_mask.to(device)
+
         logits = model(inputs)
         components = None
+        saliency_prediction = None
         if isinstance(logits, tuple): # wnet
-            logits_aux, logits = logits
+            if train and structural_target_builder is not None:
+                if len(logits) != 3:
+                    raise RuntimeError('structural saliency training expected a 3-tuple (x1, x2, saliency), got length {}'.format(len(logits)))
+                logits_aux, logits, saliency_prediction = logits
+            else:
+                logits_aux, logits = logits
             if model.n_classes == 1: # SegmentationLoss (same criterion on each head)
                 tgt = labels.unsqueeze(dim=1).float()
                 loss_aux, comps_aux = criterion(logits_aux, tgt, distance_map=distance_maps)
@@ -180,6 +215,23 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
                 loss, components = criterion(logits, labels.unsqueeze(dim=1).float(), distance_map=distance_maps)  # SegmentationLoss
             else:
                 loss = criterion(logits, labels)  # CrossEntropyLoss()
+
+        if saliency_prediction is not None:
+            with torch.no_grad():
+                saliency_target = structural_target_builder(
+                    structural_reference, structural_mask)
+            if saliency_prediction.shape != saliency_target.shape:
+                raise RuntimeError('saliency prediction shape {} != target shape {}'.format(
+                    tuple(saliency_prediction.shape), tuple(saliency_target.shape)))
+            if not torch.isfinite(saliency_prediction).all():
+                raise RuntimeError('nonfinite saliency prediction')
+            if not torch.isfinite(saliency_target).all():
+                raise RuntimeError('nonfinite saliency target')
+            saliency_loss = F.mse_loss(saliency_prediction, saliency_target, reduction='mean')
+            loss = loss + structural_saliency_weight * saliency_loss
+            if components is None:
+                components = {}
+            components['structural_saliency'] = saliency_loss.detach()
 
         # if train:  # only in training mode
         #     optimizer.zero_grad()
@@ -215,7 +267,8 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
     return None, None, run_loss, tr_lr, comp_means
 
 def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0,
-                    cycle=0, epoch_checkpointing_from=0, epoch_callback=None):
+                    cycle=0, epoch_checkpointing_from=0, epoch_callback=None,
+                    structural_target_builder=None, structural_saliency_weight=0.0):
 
     model.train()
     optimizer.zero_grad()
@@ -229,7 +282,9 @@ def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=No
             epoch_mode = epoch_checkpointing_from > 0 and cycle + 1 >= epoch_checkpointing_from
             assess = epoch_mode or is_cycle_end
             tr_logits, tr_labels, tr_loss, tr_lr, tr_comps = run_one_epoch(train_loader, model, criterion, optimizer=optimizer,
-                                                          scheduler=scheduler, grad_acc_steps=grad_acc_steps, assess=assess)
+                                                          scheduler=scheduler, grad_acc_steps=grad_acc_steps, assess=assess,
+                                                          structural_target_builder=structural_target_builder,
+                                                          structural_saliency_weight=structural_saliency_weight)
             t.set_postfix(tr_loss_lr="{:.4f}/{:.6f}".format(float(tr_loss), tr_lr))
             if assess and epoch_callback is not None:
                 assessment = (tr_logits, tr_labels, tr_loss, tr_comps, cycle + 1, epoch + 1, is_cycle_end)
@@ -244,7 +299,8 @@ def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=No
     return tr_logits, tr_labels, tr_loss, tr_comps
 
 def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, exp_path,
-                epoch_checkpointing_from=0, metric_tolerances=None, do_not_save=False):
+                epoch_checkpointing_from=0, metric_tolerances=None, do_not_save=False,
+                structural_target_builder=None, structural_saliency_weight=0.0):
 
     n_cycles = len(scheduler.cycle_lens)
     policy = parse_metric_policy(metric, metric_tolerances)
@@ -256,6 +312,8 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
     global_epoch = 0
     completed_epochs = 0
     history_path = osp.join(exp_path, 'checkpoint_history.jsonl') if exp_path and not do_not_save else None
+    # Display-only weight for the training-only structural-saliency component.
+    extra_weights = {'structural_saliency': structural_saliency_weight} if structural_saliency_weight > 0 else None
 
     def rng_state():
         return (random.getstate(), np.random.get_state(), torch.get_rng_state(),
@@ -300,7 +358,7 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
                 progress_write('Bridge gates: {}'.format(gate_summary))
             progress_write('Train/Val Loss: {:.4f}/{:.4f} -- Train/Val AUC: {:.4f}/{:.4f} -- Train/Val DICE: {:.4f}/{:.4f} -- LR={:.6f}'.format(
                 tr_loss, vl_loss, tr_auc, vl_auc, tr_dice, vl_dice, get_lr(optimizer)).rstrip('0'))
-            if tr_comps: progress_write(format_loss_components('Train', tr_comps, criterion))
+            if tr_comps: progress_write(format_loss_components('Train', tr_comps, criterion, extra_weights=extra_weights))
             if vl_comps: progress_write(format_loss_components('Val', vl_comps, criterion))
             previous = incumbent
             incumbent = current.copy()
@@ -337,7 +395,9 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
             global_epoch = cycle_start + args[5]
             return assess_and_select(*args)
         train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle,
-                        epoch_checkpointing_from=epoch_checkpointing_from, epoch_callback=callback)
+                        epoch_checkpointing_from=epoch_checkpointing_from, epoch_callback=callback,
+                        structural_target_builder=structural_target_builder,
+                        structural_saliency_weight=structural_saliency_weight)
         completed_epochs += scheduler.cycle_lens[cycle]
         print('-' * shutil.get_terminal_size(fallback=(80, 24)).columns)
 
@@ -463,6 +523,15 @@ if __name__ == '__main__':
         n_classes=1
         label_values = [0, 255]
 
+    # Structural-saliency self-supervision validation (plan §3).
+    try:
+        validate_structural_saliency(
+            args.structural_saliency, args.model_name, n_classes, args.in_c,
+            args.structural_saliency_weight, args.structural_saliency_kernel,
+            args.structural_saliency_sigma, args.structural_saliency_ratio)
+    except ValueError as e:
+        parser.error(str(e))
+
     # Composable segmentation criterion, built once through the generic builder,
     # outside all FreeSDG/Raffe conditionals: vanilla LwNet and every
     # augmentation variant use exactly the same criterion. Validation runs once
@@ -484,7 +553,7 @@ if __name__ == '__main__':
 
 
     print("* Creating Dataloaders, batch size = {}, workers = {}".format(bs, args.num_workers))
-    train_loader, val_loader = get_train_val_loaders(csv_path_train=csv_train, csv_path_val=csv_val, batch_size=bs, tg_size=tg_size, label_values=label_values, num_workers=args.num_workers, freesdg_cfg=freesdg_cfg, need_distance_map=need_distance_map)
+    train_loader, val_loader = get_train_val_loaders(csv_path_train=csv_train, csv_path_val=csv_val, batch_size=bs, tg_size=tg_size, label_values=label_values, num_workers=args.num_workers, freesdg_cfg=freesdg_cfg, need_distance_map=need_distance_map, need_structural_saliency=args.structural_saliency)
 
     # grad_acc_steps: if I want to train with a fake_bs=K but the actual bs I want is bs=N, then you use
     # grad_acc_steps = N/K - 1.
@@ -503,6 +572,30 @@ if __name__ == '__main__':
         args.cross_stage_bridge, args.cross_stage_bridge_scales, args.cross_stage_bridge_init,
         sum(p.numel() for p in model.parameters() if p.requires_grad)))
     optimizer = torch.optim.Adam(model.parameters(), lr=max_lr)
+
+    # Structural-saliency target builder (plan §41): constructed once, on the
+    # training device, with no trainable parameters. Never part of the model or
+    # the optimizer.
+    structural_target_builder = None
+    if args.structural_saliency:
+        structural_target_builder = StructuralSaliencyTarget(
+            kernel_size=args.structural_saliency_kernel,
+            sigma=args.structural_saliency_sigma,
+            ratio=args.structural_saliency_ratio,
+        ).to(device)
+        structural_target_builder.eval()
+        print('Structural saliency self-supervision: ENABLED')
+        print('  decoder branch: U-Net 1 encoder -> auxiliary U-Net decoder')
+        print('  output channels: 3')
+        print('  reconstruction loss: MSE')
+        print('  weight: {}'.format(args.structural_saliency_weight))
+        print('  Gaussian kernel: {}'.format(args.structural_saliency_kernel))
+        print('  Gaussian sigma: {}'.format(args.structural_saliency_sigma))
+        print('  HFC ratio: {}'.format(args.structural_saliency_ratio))
+        print('  target source: geometrically synchronized non-frequency-augmented RGB image')
+        print('  inference branch: disabled')
+    else:
+        print('Structural saliency self-supervision: disabled')
 
     ### TRAINING WITH PSEUDO-LABELS
     csv_test = args.csv_test
@@ -534,7 +627,9 @@ if __name__ == '__main__':
 
     result = train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps,
                          metric, experiment_path, epoch_checkpointing_from=args.epoch_checkpointing_from,
-                         metric_tolerances=args.metric_tolerances, do_not_save=do_not_save)
+                         metric_tolerances=args.metric_tolerances, do_not_save=do_not_save,
+                         structural_target_builder=structural_target_builder,
+                         structural_saliency_weight=args.structural_saliency_weight)
 
     print("val_auc: %s" % result['val_auc'])
     print("val_dice: %s" % result['val_dice'])
