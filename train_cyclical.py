@@ -32,7 +32,8 @@ parser.add_argument('--min_lr', type=float, default=1e-8, help='learning rate')
 parser.add_argument('--max_lr', type=float, default=0.01, help='learning rate')
 parser.add_argument('--cycle_lens', type=str, default='20/50', help='cycling config (nr cycles/cycle len')
 parser.add_argument('--metric', type=str, default='auc', help='which metric to use for monitoring progress (tr_auc/auc/loss/dice)')
-parser.add_argument('--checkpoint_interval', choices=['cycle', 'epoch'], default='cycle', help='when to assess and compare checkpoints')
+parser.add_argument('--epoch_checkpointing_from', type=int, default=0,
+                    help='start epoch-level checkpointing at this 1-based cycle; 0 keeps cycle-level checkpointing')
 parser.add_argument('--metric_tolerances', type=str, default=None, help='optional comma-separated metric=value absolute tolerances')
 parser.add_argument('--im_size', help='delimited list input, could be 600,400', type=str, default='512')
 parser.add_argument('--in_c', type=int, default=3, help='channels in input images')
@@ -214,7 +215,7 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
     return None, None, run_loss, tr_lr, comp_means
 
 def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0,
-                    cycle=0, checkpoint_interval='cycle', epoch_callback=None):
+                    cycle=0, epoch_checkpointing_from=0, epoch_callback=None):
 
     model.train()
     optimizer.zero_grad()
@@ -225,13 +226,14 @@ def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=No
     with tqdm(range(cycle_len)) as t:
         for epoch in t:
             is_cycle_end = epoch == cycle_len - 1
-            assess = checkpoint_interval == 'epoch' or is_cycle_end
+            epoch_mode = epoch_checkpointing_from > 0 and cycle + 1 >= epoch_checkpointing_from
+            assess = epoch_mode or is_cycle_end
             tr_logits, tr_labels, tr_loss, tr_lr, tr_comps = run_one_epoch(train_loader, model, criterion, optimizer=optimizer,
                                                           scheduler=scheduler, grad_acc_steps=grad_acc_steps, assess=assess)
             t.set_postfix(tr_loss_lr="{:.4f}/{:.6f}".format(float(tr_loss), tr_lr))
             if assess and epoch_callback is not None:
                 assessment = (tr_logits, tr_labels, tr_loss, tr_comps, cycle + 1, epoch + 1, is_cycle_end)
-                if checkpoint_interval == 'cycle':
+                if not epoch_mode:
                     deferred_assessment = assessment
                 else:
                     epoch_callback(*assessment, t.write)
@@ -242,7 +244,7 @@ def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=No
     return tr_logits, tr_labels, tr_loss, tr_comps
 
 def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, exp_path,
-                checkpoint_interval='cycle', metric_tolerances=None, do_not_save=False):
+                epoch_checkpointing_from=0, metric_tolerances=None, do_not_save=False):
 
     n_cycles = len(scheduler.cycle_lens)
     policy = parse_metric_policy(metric, metric_tolerances)
@@ -292,7 +294,7 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
         if gate_summary:
             record['bridge_gates'] = gate_summary
         if selected:
-            if checkpoint_interval == 'epoch':
+            if epoch_checkpointing_from > 0 and cycle + 1 >= epoch_checkpointing_from:
                 progress_write('------------------------- Epoch {} -------------------------'.format(global_epoch))
             if gate_summary:
                 progress_write('Bridge gates: {}'.format(gate_summary))
@@ -302,7 +304,7 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
             if vl_comps: progress_write(format_loss_components('Val', vl_comps, criterion))
             previous = incumbent
             incumbent = current.copy()
-            selection_stats = {'selection_policy_version': 1, 'checkpoint_interval': checkpoint_interval,
+            selection_stats = {'selection_policy_version': 1, 'epoch_checkpointing_from': epoch_checkpointing_from,
                 'metric_order': order, 'metric_tolerances': tolerances, 'selected_metrics': incumbent,
                 'best_cycle': cycle, 'best_epoch_in_cycle': epoch_in_cycle, 'best_global_epoch': global_epoch,
                 'selection_reason': reason, 'max_validation_auc_seen': max_validation_auc_seen}
@@ -335,7 +337,7 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
             global_epoch = cycle_start + args[5]
             return assess_and_select(*args)
         train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle,
-                        checkpoint_interval=checkpoint_interval, epoch_callback=callback)
+                        epoch_checkpointing_from=epoch_checkpointing_from, epoch_callback=callback)
         completed_epochs += scheduler.cycle_lens[cycle]
         print('-' * shutil.get_terminal_size(fallback=(80, 24)).columns)
 
@@ -425,6 +427,8 @@ if __name__ == '__main__':
 
     if len(cycle_lens)==2: # handles option of specifying cycles as pair (n_cycles, cycle_len)
         cycle_lens = cycle_lens[0]*[cycle_lens[1]]
+    if args.epoch_checkpointing_from < 0 or args.epoch_checkpointing_from > len(cycle_lens):
+        parser.error('--epoch_checkpointing_from must be 0 or between 1 and the cycle count ({})'.format(len(cycle_lens)))
 
     im_size = tuple([int(item) for item in args.im_size.split(',')])
     if isinstance(im_size, tuple) and len(im_size)==1:
@@ -529,7 +533,7 @@ if __name__ == '__main__':
 
 
     result = train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps,
-                         metric, experiment_path, checkpoint_interval=args.checkpoint_interval,
+                         metric, experiment_path, epoch_checkpointing_from=args.epoch_checkpointing_from,
                          metric_tolerances=args.metric_tolerances, do_not_save=do_not_save)
 
     print("val_auc: %s" % result['val_auc'])
