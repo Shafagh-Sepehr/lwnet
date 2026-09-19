@@ -415,8 +415,7 @@ if __name__ == '__main__':
         device = torch.device(args.device)
 
     # reproducibility
-    seed_value = 0
-    set_seeds(seed_value, args.device.startswith("cuda"))
+    set_seeds(args.seed, args.device.startswith("cuda"))
 
     # gather parser parameters
     model_name = args.model_name
