@@ -118,6 +118,22 @@ def format_loss_components(split, comps, criterion):
             parts.append('{:s}={:.4f} (w={:g} -> {:.4f})'.format(name, value, w, w * value))
     return '{} loss components: {}'.format(split, ' | '.join(parts))
 
+
+def format_metric_transition(previous, candidate):
+    """Format two metrics precisely enough to show where they diverge."""
+    previous_text = '{:.16f}'.format(float(previous))
+    candidate_text = '{:.16f}'.format(float(candidate))
+    previous_decimals = previous_text.split('.')[1]
+    candidate_decimals = candidate_text.split('.')[1]
+    shared = 0
+    for left, right in zip(previous_decimals, candidate_decimals):
+        if left != right:
+            break
+        shared += 1
+    precision = min(shared + 2, 16)
+    template = '{:.' + str(precision) + 'f}'
+    return template.format(float(previous)), template.format(float(candidate))
+
 def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
         grad_acc_steps=0, assess=False):
     device='cuda' if next(model.parameters()).is_cuda else 'cpu'
@@ -204,17 +220,24 @@ def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=No
     optimizer.zero_grad()
     cycle_len = scheduler.cycle_lens[cycle]
 
-    with tqdm(total=cycle_len) as t:
-        for epoch in range(cycle_len):
+    deferred_assessment = None
+
+    with tqdm(range(cycle_len)) as t:
+        for epoch in t:
             is_cycle_end = epoch == cycle_len - 1
             assess = checkpoint_interval == 'epoch' or is_cycle_end
             tr_logits, tr_labels, tr_loss, tr_lr, tr_comps = run_one_epoch(train_loader, model, criterion, optimizer=optimizer,
                                                           scheduler=scheduler, grad_acc_steps=grad_acc_steps, assess=assess)
             t.set_postfix(tr_loss_lr="{:.4f}/{:.6f}".format(float(tr_loss), tr_lr))
             if assess and epoch_callback is not None:
-                epoch_callback(tr_logits, tr_labels, tr_loss, tr_comps, cycle + 1, epoch + 1,
-                               is_cycle_end, t.write)
-            t.update(1)
+                assessment = (tr_logits, tr_labels, tr_loss, tr_comps, cycle + 1, epoch + 1, is_cycle_end)
+                if checkpoint_interval == 'cycle':
+                    deferred_assessment = assessment
+                else:
+                    epoch_callback(*assessment, t.write)
+
+    if deferred_assessment is not None and epoch_callback is not None:
+        epoch_callback(*deferred_assessment, print)
 
     return tr_logits, tr_labels, tr_loss, tr_comps
 
@@ -242,7 +265,7 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
             torch.cuda.set_rng_state_all(state[3])
 
     def assess_and_select(tr_logits, tr_labels, tr_loss, tr_comps, cycle, epoch_in_cycle,
-                          is_cycle_end, progress_write):
+                          is_cycle_end, progress_write=print):
         nonlocal incumbent, selection_stats, max_validation_auc_seen, global_epoch
         tr_auc, tr_dice = evaluate(tr_logits, tr_labels, model.n_classes)
         del tr_logits, tr_labels
@@ -260,21 +283,23 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
         current = {'auc': float(vl_auc), 'dice': float(vl_dice), 'loss': float(vl_loss), 'tr_auc': float(tr_auc)}
         max_validation_auc_seen = current['auc'] if max_validation_auc_seen is None else max(max_validation_auc_seen, current['auc'])
         selected, reason, details = compare_checkpoint(current, incumbent, order, tolerances)
-        progress_write('Train/Val Loss: {:.4f}/{:.4f} -- Train/Val AUC: {:.4f}/{:.4f} -- Train/Val DICE: {:.4f}/{:.4f} -- LR={:.6f}'.format(
-            tr_loss, vl_loss, tr_auc, vl_auc, tr_dice, vl_dice, get_lr(optimizer)).rstrip('0'))
-        if tr_comps: progress_write(format_loss_components('Train', tr_comps, criterion))
-        if vl_comps: progress_write(format_loss_components('Val', vl_comps, criterion))
         gate_summary = None
         if hasattr(model, 'bridge_gate_summary'):
             gate_summary = model.bridge_gate_summary()
-        if gate_summary:
-            progress_write('Bridge gates: {}'.format(gate_summary))
         record = {'cycle': cycle, 'epoch_in_cycle': epoch_in_cycle, 'global_epoch': global_epoch,
                   'metrics': current, 'incumbent_metrics': incumbent, 'comparison_reason': reason,
                   'selected': selected, 'saved': False}
         if gate_summary:
             record['bridge_gates'] = gate_summary
         if selected:
+            if checkpoint_interval == 'epoch':
+                progress_write('------------------------- Epoch {} -------------------------'.format(global_epoch))
+            if gate_summary:
+                progress_write('Bridge gates: {}'.format(gate_summary))
+            progress_write('Train/Val Loss: {:.4f}/{:.4f} -- Train/Val AUC: {:.4f}/{:.4f} -- Train/Val DICE: {:.4f}/{:.4f} -- LR={:.6f}'.format(
+                tr_loss, vl_loss, tr_auc, vl_auc, tr_dice, vl_dice, get_lr(optimizer)).rstrip('0'))
+            if tr_comps: progress_write(format_loss_components('Train', tr_comps, criterion))
+            if vl_comps: progress_write(format_loss_components('Val', vl_comps, criterion))
             previous = incumbent
             incumbent = current.copy()
             selection_stats = {'selection_policy_version': 1, 'checkpoint_interval': checkpoint_interval,
@@ -288,8 +313,10 @@ def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler
                     reason if reason in current else order[0], current[reason] if reason in current else current[order[0]],
                     cycle, epoch_in_cycle, global_epoch))
             else:
-                progress_write('Best {} attained: incumbent={} -> candidate={:.8f} (cycle {}, epoch {}, global epoch {})'.format(
-                    reason, previous.get(reason, float('nan')), current.get(reason, float('nan')),
+                previous_metric, candidate_metric = format_metric_transition(
+                    previous.get(reason, float('nan')), current.get(reason, float('nan')))
+                progress_write('Best {} attained: incumbent={} -> candidate={} (cycle {}, epoch {}, global epoch {})'.format(
+                    reason, previous_metric, candidate_metric,
                     cycle, epoch_in_cycle, global_epoch))
             if exp_path and not do_not_save:
                 progress_write('-------------------------  Checkpointing  -------------------------')
