@@ -273,9 +273,11 @@ class FrU2LiteTests(unittest.TestCase):
         av_model.mode = 'eval'
         with torch.no_grad():
             generated_av, _ = generate_av_results.create_pred(
-                av_model, tensor, mask, coords, (32, 32), tta='no')
+                av_model, tensor, mask, coords, (32, 32), tta='no',
+                device=torch.device('cpu'))
             predicted_av, _ = predict_one_image_av.create_pred(
-                av_model, tensor, mask, coords, (32, 32), tta='no')
+                av_model, tensor, mask, coords, (32, 32), tta='no',
+                device=torch.device('cpu'))
         self.assertEqual(generated_av.shape, (32, 32, 3))
         self.assertEqual(predicted_av.shape, (32, 32, 3))
         self.assertTrue(np.isfinite(generated_av).all())

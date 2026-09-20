@@ -105,9 +105,10 @@ def flip_lrud(tens):
     return torch.flip(tens, dims=[1, 2])
 
 
-def create_pred(model, tens, mask, coords_crop, original_sz, tta='no'):
+def create_pred(model, tens, mask, coords_crop, original_sz, tta='no', device=None):
     act = torch.nn.Softmax(dim=0)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device is None:
+        device = next(model.parameters()).device
     with torch.no_grad():
         logits = model(tens.unsqueeze(dim=0).to(device)).squeeze(dim=0)
     prob = act(logits)
@@ -240,7 +241,9 @@ if __name__ == '__main__':
 
     print('* Saving prediction to ' + im_path_out)
     start_time = time.perf_counter()
-    full_pred, full_pred_bin = create_pred(model, im_tens, mask, coords_crop, original_sz, tta=tta)
+    full_pred, full_pred_bin = create_pred(
+        model, im_tens, mask, coords_crop, original_sz,
+        tta=tta, device=device)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         imsave(im_path_out, img_as_ubyte(full_pred))
