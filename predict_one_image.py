@@ -11,7 +11,7 @@ from skimage.io import imsave
 from skimage.util import img_as_ubyte
 from skimage.transform import resize
 import torch
-from models.get_model import get_arch, get_arch_options, set_eval_mode
+from models.get_model import get_arch_from_config
 from utils.model_saving_loading import load_model
 from skimage.measure import regionprops
 
@@ -248,9 +248,7 @@ if __name__ == '__main__':
         im_tens = anchoror.anchor(im_tens, tvF.to_tensor(mask_rsz))
 
     print('* Instantiating model  = ' + str(model_name))
-    arch_opts = get_arch_options(model_cfg)
-    model = get_arch(model_name, in_c=in_c, **arch_opts).to(device)
-    set_eval_mode(model)
+    model = get_arch_from_config(model_cfg, in_c=in_c, device=device)
 
     print('* Loading trained weights from ' + model_path)
     model, stats = load_model(model, model_path, device)

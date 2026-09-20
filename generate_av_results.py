@@ -12,7 +12,7 @@ from skimage.color import label2rgb
 
 import torch
 from utils.model_saving_loading import str2bool
-from models.get_model import get_arch, get_arch_options, set_eval_mode
+from models.get_model import get_arch_from_config
 from utils.get_loaders import get_test_dataset
 from utils.model_saving_loading import load_model
 
@@ -167,9 +167,7 @@ if __name__ == '__main__':
     print('* Reading test data from ' + osp.join(data_path, csv_path))
     test_dataset = get_test_dataset(data_path, csv_path=csv_path, tg_size=tg_size)
     print('* Instantiating model  = ' + str(model_name))
-    arch_opts = get_arch_options(args)
-    model = get_arch(model_name, n_classes=4, **arch_opts).to(device)
-    set_eval_mode(model)
+    model = get_arch_from_config(args, n_classes=4, device=device)
 
     print('* Loading trained weights from ' + experiment_path)
     try:

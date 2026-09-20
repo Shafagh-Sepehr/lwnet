@@ -22,14 +22,15 @@ Please find below a table of contents describing what you can find in this repos
 ## Table of Contents
 1. [Dependencies and getting the data ready](https://github.com/agaldran/lwnet#1-dependencies-and-getting-the-data-ready)
 2. [Training a W-Net for vessel segmentation](https://github.com/agaldran/lwnet#2-training-a-w-net-for-vessel-segmentation)
-3. [Generating segmentations](https://github.com/agaldran/lwnet#3-generating-segmentations)
-4. [Computing Performance](https://github.com/agaldran/lwnet#4-computing-performance)
-5. [Cross-Dataset Experiments](https://github.com/agaldran/lwnet#5-cross-dataset-experiments)
-6. [Training with pseudo-labels and computing performance](https://github.com/agaldran/lwnet#6-training-with-pseudo-labels-and-computing-performance)
-7. [Evaluating your own model](https://github.com/agaldran/lwnet#7-evaluating-your-own-model)
-8. [Training a W-Net for Artery/Vein segmentation](https://github.com/agaldran/lwnet#8-training-a-w-net-for-arteryvein-segmentation)
-9. [Generating Artery/Vein segmentations](https://github.com/agaldran/lwnet#9-generating-arteryvein-segmentations)
-10. [Generating vessel and A/V segmentations on your own data](https://github.com/agaldran/lwnet#10-generating-vessel-and-av-segmentations-on-your-own-data)
+3. [Full-resolution W-Net variants](https://github.com/agaldran/lwnet#21-full-resolution-w-net-variants)
+4. [Generating segmentations](https://github.com/agaldran/lwnet#4-generating-segmentations)
+5. [Computing Performance](https://github.com/agaldran/lwnet#5-computing-performance)
+6. [Cross-Dataset Experiments](https://github.com/agaldran/lwnet#6-cross-dataset-experiments)
+7. [Training with pseudo-labels and computing performance](https://github.com/agaldran/lwnet#7-training-with-pseudo-labels-and-computing-performance)
+8. [Evaluating your own model](https://github.com/agaldran/lwnet#8-evaluating-your-own-model)
+9. [Training a W-Net for Artery/Vein segmentation](https://github.com/agaldran/lwnet#9-training-a-w-net-for-arteryvein-segmentation)
+10. [Generating Artery/Vein segmentations](https://github.com/agaldran/lwnet#10-generating-arteryvein-segmentations)
+11. [Generating vessel and A/V segmentations on your own data](https://github.com/agaldran/lwnet#11-generating-vessel-and-av-segmentations-on-your-own-data)
 
 ## 1. Dependencies and getting the data ready
 First things first, clone this repo somewhere in your computer:
@@ -99,7 +100,46 @@ As CHASE-DB has less training images than DRIVE (8 vs 16), we double the number 
 Note that we use a `batch_size` of 4 by default, and that we train on HRF with an image size of `1024x1024`.
 In order to train on a single GPU, we use gradient accumulation in that case.
 
-## 2.1 Gated cross-stage decoder bridges (A1)
+## 2.1 Full-resolution W-Net variants
+
+The second W-Net stage can use the original Little U-Net, the full
+full-resolution/multi-resolution FR-U2 architecture, or its fixed-width Lite
+variant:
+
+| Selection | U2 architecture |
+|---|---|
+| no FR flag | Original Little U-Net (backward-compatible default) |
+| `--u2_arch fr_multi` | Full FR-U2, five interaction stages, dilations `1,2,4,2,1` |
+| `--fr_lite` | FR-U2-Lite, 4/8/16 channels, three interaction stages, dilations `1,2,1` |
+
+`--fr_lite` is sufficient by itself and resolves the saved configuration to
+`u2_arch=fr_multi` with effective Lite values. User-supplied full-FR width and
+dilation options are ignored for Lite and are serialized as `4` and
+`[1,2,1]`. Lite and full FR do not support A1 cross-stage bridges; use
+`--cross_stage_bridge none`.
+
+Example Lite training command:
+
+```
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 20/50
+                         --model_name wnet --fr_lite --save_path wnet_drive_fr_lite
+                         --device cuda:0 --seed 0
+```
+
+Inference scripts recover `u2_arch` and `fr_lite` automatically from the saved
+`config.cfg`, so no Lite-specific inference flag is required:
+
+```
+python generate_results.py --config_file experiments/wnet_drive_fr_lite/config.cfg
+                           --dataset DRIVE --device cuda:0
+```
+
+The FR-Lite and full-FR options select architectures; they do not by
+themselves establish segmentation-quality improvements. Use matched seeds,
+training schedules, checkpoint-selection policies, preprocessing, splits, and
+threshold calibration when comparing variants.
+
+## 2.2 Gated cross-stage decoder bridges (A1)
 
 The W-Net can optionally give U-Net 2 direct access to U-Net 1's multi-scale decoder
 representations through zero-initialized gated residual bridges. At each selected decoder
@@ -125,7 +165,7 @@ Inference requires no new bridge flags: when `--config_file` (or a model directo
 `config.cfg`) is supplied, the bridge architecture is recovered automatically and the checkpoint
 is loaded strictly.
 
-## 3. Generating segmentations
+## 4. Generating segmentations
 Once the model is trained, you can produce the corresponding segmentations calling `generate_results.py` and specifying which dataset should be used:
 ```
 python generate_results.py --config_file experiments/wnet_drive/config.cfg
@@ -137,7 +177,7 @@ python generate_results.py --config_file experiments/wnet_hrf_1024/config.cfg
 ```
 The above stores the predictions for those datasets in `results/DRIVE/experiments/wnet_drive`, `results/CHASEDB/experiments/wnet_chasedb`, and `results/HRF/experiments/wnet_hrf_1024` respectively.
 
-## 4. Computing Performance
+## 5. Computing Performance
 We call `analyze_results.py` to compute performance.
 It is important to specify what was the training and what is the test set here.
 For that, you pass the path to the train/test predictions, and the name of the train/test datasets:
@@ -155,7 +195,7 @@ python analyze_results.py --path_train_preds results/HRF/experiments/wnet_hrf_10
                           --train_dataset HRF --test_dataset HRF
 ```
 The code uses the csv files in each dataset folder to check which images should be used for running an AUC analysis in the training set and finding an optimal binarizing threshold to be used in the test set images.
-## 5. Cross-Dataset Experiments
+## 6. Cross-Dataset Experiments
 When a model has been trained on dataset A (say, DRIVE) and we want to test it on dataset B (say, CHASE-DB), we first generate segmentations on both datasets:
 ```
 python generate_results.py --config_file experiments/wnet_drive/config.cfg
@@ -170,7 +210,7 @@ python analyze_results.py --path_train_preds results/DRIVE/experiments/wnet_driv
                           --train_dataset DRIVE --test_dataset CHASEDB
 ```
 
-## 6. Training with pseudo-labels and computing performance
+## 7. Training with pseudo-labels and computing performance
 1) Train a model on a source dataset (DRIVE); this will store the model in `experiments/wnet_drive`
 ```
 python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 20/50
@@ -215,7 +255,7 @@ python analyze_results.py --path_train_preds results/DRIVE/experiments/wnet_driv
                           --train_dataset DRIVE --test_dataset CHASEDB
 ```
 
-## 7. Evaluating your own model
+## 8. Evaluating your own model
 We have made also an effort in making our evaluation protocol easy to use.
 You just need to build your own probabilistic segmentations with your segmentation system and store training/test predictions in folders called `train_preds` and `trest_preds`.
 
@@ -230,7 +270,7 @@ python analyze_results.py --path_train_preds train_preds --path_test_preds test_
 Be very careful to use the same train/test splits as we are using here (check the csvs in the corresponding dataset folder), or you might be testing on training data.
 Also, predictions should have the same exact name as the corresponding retinal images, but with a `.png` extension (otherwise the code will not find them).
 
-## 8. Training a W-Net for Artery/Vein segmentation
+## 9. Training a W-Net for Artery/Vein segmentation
 In our work we train models on DRIVE and HRF, and we use a larger W-Net in this task.
 Again, HRF is trained at image size `1024x1024`:
 ```
@@ -245,7 +285,7 @@ python train_cyclical.py --csv_train data/HRF/train_av.csv --model_name big_wnet
                          --im_size 1024 --batch_size 2 --grad_acc_steps 1  --device cuda:0
 ```
 
-## 9. Generating Artery/Vein segmentations
+## 10. Generating Artery/Vein segmentations
 This is similar to the vessel segmentation case, but calling `generate_av_results.py` instead::
 ```
 python generate_av_results.py --config_file experiments/big_wnet_drive_av/config.cfg
@@ -259,7 +299,7 @@ python generate_av_results.py --config_file experiments/big_wnet_hrf_av_1024/con
                               --dataset HRF --im_size 1024 --device cuda:0
 ```
 
-## 10. Generating vessel and A/V segmentations on your own data
+## 11. Generating vessel and A/V segmentations on your own data
 To make it easy to construct segmentations on new data, we have also made available pretrained weights in the `experiments/` folder, and a script you can call on your own images:
 ```
 python predict_one_image.py --model_path experiments/wnet_drive/

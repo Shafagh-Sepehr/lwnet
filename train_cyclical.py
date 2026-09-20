@@ -7,7 +7,10 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn.functional as F
-from models.get_model import get_arch, get_arch_options, validate_cross_stage_bridge, validate_structural_saliency
+from models.get_model import (
+    get_arch, get_arch_options, validate_cross_stage_bridge,
+    validate_structural_saliency, validate_u2_arch,
+)
 
 from utils.get_loaders import get_train_val_loaders
 from utils.evaluation import evaluate, ewma
@@ -28,6 +31,14 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument('--csv_train', type=str, default='data/DRIVE/train.csv', help='path to training data csv')
 parser.add_argument('--model_name', type=str, default='wnet', help='architecture')
+parser.add_argument('--u2_arch', choices=['unet', 'fr_multi'], default='unet',
+                    help='second-stage architecture: original Little U-Net or full-resolution multi-resolution U2')
+parser.add_argument('--fr_u2_base_channels', type=int, default=8,
+                    help='base channel width of FR-U2')
+parser.add_argument('--fr_u2_dilations', type=str, default='1,2,4,2,1',
+                    help='ordered dilation schedule for FR-U2 multi-resolution interaction stages')
+parser.add_argument('--fr_lite', action='store_true',
+                    help='use the lightweight full-resolution multi-resolution U2; implies --u2_arch fr_multi')
 parser.add_argument('--batch_size', type=int, default=4, help='batch Size')
 parser.add_argument('--grad_acc_steps', type=int, default=0, help='gradient accumulation steps (0)')
 parser.add_argument('--min_lr', type=float, default=1e-8, help='learning rate')
@@ -95,6 +106,26 @@ def validate_freesdg_args(args):
 def write_training_config(args, config_file_path):
     with open(config_file_path, 'w') as f:
         json.dump(vars(args), f, indent=2)
+
+
+def format_fr_u2_dilations(dilations):
+    return '[{}]'.format(','.join(str(d) for d in dilations))
+
+
+def resolve_arch_args(args):
+    """Canonicalize architecture flags before config serialization."""
+    if args.fr_lite:
+        args.u2_arch = 'fr_multi'
+
+    args.u2_arch, args.fr_u2_base_channels, args.fr_u2_dilations = validate_u2_arch(
+        args.u2_arch,
+        args.fr_u2_base_channels,
+        args.fr_u2_dilations,
+        args.model_name,
+        args.cross_stage_bridge,
+        fr_lite=args.fr_lite,
+    )
+    return args
 
 
 # Zero-initialized gated cross-stage decoder bridges (A1)
@@ -445,6 +476,11 @@ if __name__ == '__main__':
         selection_policy = parse_metric_policy(args.metric, args.metric_tolerances)
     except ValueError as e:
         parser.error(str(e))
+
+    try:
+        resolve_arch_args(args)
+    except ValueError as e:
+        parser.error(str(e))
     args.metric = selection_policy['metric']
     args.metric_order = selection_policy['metric_order']
     args.resolved_metric_tolerances = selection_policy['metric_tolerances']
@@ -594,8 +630,21 @@ if __name__ == '__main__':
     model = model.to(device)
 
     print("Total params: {0:,}".format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
-    print('* Architecture summary: cross_stage_bridge={} scales={} init={} trainable_params={}'.format(
-        args.cross_stage_bridge, args.cross_stage_bridge_scales, args.cross_stage_bridge_init,
+    print('* Architecture summary:')
+    print('  model_name={}'.format(model_name))
+    print('  U1=LittleUNet[8,16,32]')
+    print('  U2 family={}'.format(args.u2_arch))
+    if args.u2_arch == 'fr_multi':
+        print('  FR variant={}'.format('lite' if args.fr_lite else 'full'))
+        print('  FR base channels={}'.format(args.fr_u2_base_channels))
+        print('  FR dilations={}'.format(format_fr_u2_dilations(args.fr_u2_dilations)))
+        if args.fr_lite:
+            print('  FR channels=4/8/16')
+            print('  FR fusion stages=3')
+    print('  cross_stage_bridge={} scales={} init={}'.format(
+        args.cross_stage_bridge, args.cross_stage_bridge_scales, args.cross_stage_bridge_init))
+    print('  structural_saliency={}'.format(args.structural_saliency))
+    print('  trainable_params={}'.format(
         sum(p.numel() for p in model.parameters() if p.requires_grad)))
     optimizer = torch.optim.Adam(model.parameters(), lr=max_lr)
 
