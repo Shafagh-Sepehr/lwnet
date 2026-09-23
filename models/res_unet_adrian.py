@@ -166,7 +166,7 @@ class AuxiliarySaliencyDecoder(nn.Module):
     """Auxiliary decoder that reconstructs a 3-channel structural-saliency map.
 
     Branches from a U-Net encoder's bottleneck and skip features and mirrors
-    the existing U-Net decoder topology (plan §23-§24).  It accepts no
+    the existing U-Net decoder topology. It accepts no
     cross-stage additions and uses no features from any segmentation decoder.
     Its output is ``tanh``-bounded to ``[-1, +1]`` to match the structural
     target.

@@ -79,7 +79,7 @@ parser.add_argument(
     help=('disable post-frequency ColorJitter only for non-raw '
           'FreeSDG/RAFFE training samples; raw samples retain the full '
           'original LwNet augmentation pipeline'))
-# RaffeSDG-derived structural-saliency self-supervision (plan §2)
+# Optional RaffeSDG-derived structural-saliency self-supervision.
 parser.add_argument('--structural_saliency', action='store_true', help='enable RaffeSDG-derived structural-saliency self-supervision')
 parser.add_argument('--structural_saliency_weight', type=float, default=1.0, help='weight of the structural-saliency reconstruction MSE')
 parser.add_argument('--structural_saliency_kernel', type=int, default=27, help='Gaussian kernel width used to construct the structural-saliency target')
@@ -485,7 +485,7 @@ if __name__ == '__main__':
     args.metric_order = selection_policy['metric_order']
     args.resolved_metric_tolerances = selection_policy['metric_tolerances']
 
-    # FreeSDG FMAug argument validation (plan §11)
+    # Validate mutually dependent augmentation options before training.
     validate_freesdg_args(args)
     if args.freesdg:
         if not (0.0 <= args.freesdg_raw_prob <= 1.0):
@@ -585,7 +585,7 @@ if __name__ == '__main__':
         n_classes=1
         label_values = [0, 255]
 
-    # Structural-saliency self-supervision validation (plan §3).
+    # Validate structural-saliency settings before constructing the model.
     try:
         validate_structural_saliency(
             args.structural_saliency, args.model_name, n_classes, args.in_c,
@@ -648,7 +648,7 @@ if __name__ == '__main__':
         sum(p.numel() for p in model.parameters() if p.requires_grad)))
     optimizer = torch.optim.Adam(model.parameters(), lr=max_lr)
 
-    # Structural-saliency target builder (plan §41): constructed once, on the
+    # Structural-saliency target builder is constructed once, on the
     # training device, with no trainable parameters. Never part of the model or
     # the optimizer.
     structural_target_builder = None

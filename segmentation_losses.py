@@ -51,7 +51,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-#: Fixed, documented smoothing epsilon for all soft terms (plan: no CLI flag).
+#: Fixed smoothing epsilon for all soft terms.
 EPS = 1e-6
 
 #: Tolerance separating genuine binary labels {0, 1} from fractional

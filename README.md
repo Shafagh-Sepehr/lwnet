@@ -1,378 +1,227 @@
-![wnet](models/fig2.png?raw=true "wnet")
+![W-Net](models/fig2.png "W-Net")
 
-# The Little W-Net that Could
-You have reached the official repository for our work on retinal vessel segmentation with minimalistic models.
-The above picture represents a WNet architecture, which contains roughly around 70k parameters and closely matches (or outperforms) other more complicated techniques.
-For more details about our work, you can check the related paper:
+# LwNet Extensions for Retinal Vessel Segmentation
 
-```
-The Little W-Net That Could: State-of-the-Art Retinal Vessel Segmentation with Minimalistic Models
-Adrian Galdran, André Anjos, Jose Dolz, Hadi Chakor, Hervé Lombaert, Ismail Ben Ayed
-https://arxiv.org/abs/2009.01907, Sep. 2020
-```
+This is an independent fork of [agaldran/lwnet](https://github.com/agaldran/lwnet). The original author's walkthrough comes first below; My optional extensions follow it. Original claims, pretrained weights, and reported scores belong to Adrian Galdran and the original LwNet authors, not to this fork.
 
-We would appreciate if you could cite our work if it is useful for you :)
+## Original Work
 
+Please cite **The Little W-Net That Could: State-of-the-Art Retinal Vessel Segmentation with Minimalistic Models**, Adrian Galdran, Andre Anjos, Jose Dolz, Hadi Chakor, Herve Lombaert, and Ismail Ben Ayed, [arXiv:2009.01907](https://arxiv.org/abs/2009.01907). The upstream repository is [agaldran/lwnet](https://github.com/agaldran/lwnet).
 
-> **Note**: If you are just looking for our results, you can directly download them [at this link](https://gitlab.com/agaldran/shared_results/-/raw/master/pre_generated_results.zip?inline=false).
+## Contents
 
+1. [Installation and Data](#installation-and-data)
+2. [Original LwNet Walkthrough](#original-lwnet-walkthrough)
+3. [Fork Extensions](#fork-extensions)
+4. [Compatibility and Caveats](#compatibility-and-caveats)
 
-Please find below a table of contents describing what you can find in this repository:
+## Installation and Data
 
-## Table of Contents
-1. [Dependencies and getting the data ready](https://github.com/agaldran/lwnet#1-dependencies-and-getting-the-data-ready)
-2. [Training a W-Net for vessel segmentation](https://github.com/agaldran/lwnet#2-training-a-w-net-for-vessel-segmentation)
-3. [Full-resolution W-Net variants](https://github.com/agaldran/lwnet#21-full-resolution-w-net-variants)
-4. [Generating segmentations](https://github.com/agaldran/lwnet#4-generating-segmentations)
-5. [Computing Performance](https://github.com/agaldran/lwnet#5-computing-performance)
-6. [Cross-Dataset Experiments](https://github.com/agaldran/lwnet#6-cross-dataset-experiments)
-7. [Training with pseudo-labels and computing performance](https://github.com/agaldran/lwnet#7-training-with-pseudo-labels-and-computing-performance)
-8. [Evaluating your own model](https://github.com/agaldran/lwnet#8-evaluating-your-own-model)
-9. [Training a W-Net for Artery/Vein segmentation](https://github.com/agaldran/lwnet#9-training-a-w-net-for-arteryvein-segmentation)
-10. [Generating Artery/Vein segmentations](https://github.com/agaldran/lwnet#10-generating-arteryvein-segmentations)
-11. [Generating vessel and A/V segmentations on your own data](https://github.com/agaldran/lwnet#11-generating-vessel-and-av-segmentations-on-your-own-data)
+Use Python 3.10 or another version with wheels for the selected PyTorch release. Install a matching CPU or CUDA build of `torch` and `torchvision` using the [official PyTorch selector](https://pytorch.org/get-started/locally/), then install the remaining direct dependencies:
 
-## 1. Dependencies and getting the data ready
-First things first, clone this repo somewhere in your computer:
-```
-git clone https://github.com/agaldran/lwnet.git .
+```bash
+pip install torch torchvision
+pip install -r requirements.txt
 ```
 
-For full reproducibility, you should use the configuration specified in the `requirements.txt` file.
-If you are using conda, you can install dependencies in one line, just run on a terminal:
-```
-conda create --name lwnet --file environment.txt
-conda activate lwnet
-```
+`environment.txt` is a historical Linux `@EXPLICIT` Conda export for Python 3.7 and CUDA 10.0. It is not a portable pip requirements file. Dataset preparation may additionally require `wget`, `unzip`, `tar`, or other platform tools.
 
-We have made an effort to automate the data download and preparation so that everything is as reproducible as possible.
-Out of the ten datasets we use in the paper, seven of them are public, and you can get them just running:
- ```
-python get_public_data.py
-```
-This will populate the `data` directory with the seven sub-folders.
-If everything goes right, each sub-folder in `data` is named as the corresponding dataset, and contains at least:
-* Three folders called `images`, `mask`, `manual`
-* A csv file called `test_all.csv`
+The original broad downloader is:
 
-If the dataset is used in our work for training a vessel segmentation model (DRIVE, CHASE-DB, and HRF), you will also find:
-* Three csv files called `train.csv`, `val.csv`, `test.csv`
-
-If the dataset also has Artery/Vein annotations, you will also see:
-* A folder called `manual_av`
-* A csv file called `test_all_av.csv`
-
-If the dataset is used in our work for training an A/V models (DRIVE and HRF), you will also find:
-* Three csv files called `train_av.csv`, `val_av.csv`, `test_av.csv`
-
-> **Note**: The DRIVE dataset will also contain a folder called `ZoneB_manual`, which is used to evaluate A/V performance around the optic disc.
-The HRF dataset will also contain folders called `images_resized`, `manual_resized`, `mask_resized`.
-These are used only for training.
-
-> **Note**: The LES-AV dataset is still public but it now needs to be downloaded manually, please see the comments in `get_public_data.py` Line 400 forward for details.
-
-## 2. Training a W-Net for vessel segmentation
-Train a model on a given dataset. You also need to supply the path to save the model.
-Note that the training defaults to using the CPU, which is feasible due to the small size of our models.
-Checkpoint validation runs at cycle boundaries by default. Use `--epoch_checkpointing_from N` to
-start epoch-level checks at cycle N (use `0` to keep cycle-level checks throughout). `--metric`
-accepts an ordered list such as `auc,dice,loss`; multi-metric
-policies use absolute near-tie tolerances (`auc=0.0005`, `dice=0.0001`, `loss=0.000001`) unless
-overridden with `--metric_tolerances`. A single metric remains strict unless an explicit tolerance
-is supplied. Comparisons are pairwise against the last selected checkpoint, so approximate equality
-is not transitive; `max_validation_auc_seen` in checkpoint metadata records the diagnostic maximum.
-To reproduce our results in table 2 of our paper, you need to run:
-```
-python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 20/50
-                         --model_name wnet --save_path wnet_drive --device cuda:0
-python train_cyclical.py --csv_train data/CHASEDB/train.csv --cycle_lens 40/50
-                         --model_name wnet --save_path wnet_chasedb --device cuda:0
-python train_cyclical.py --csv_train data/HRF/train.csv --cycle_lens 30/50
-                         --model_name wnet --save_path wnet_hrf_1024
-                         --im_size 1024 --batch_size 2 --grad_acc_steps 1 --device cuda:0
-```
-This will store the model weights in `experiments/wnet_drive`, `experiments/wnet_chasedb`, `experiments/wnet_hrf` respectively.
-
-The parameter `cycle_lens` specifies the length of the training, and it is adjusted depending on the amount of images in the training set.
-For instance, in the DRIVE case, `--cycle_lens 20/50` implies that we train for 20 cycles, each cycle running for 50 epochs.
-As CHASE-DB has less training images than DRIVE (8 vs 16), we double the number of cycles in that case.
-
-Note that we use a `batch_size` of 4 by default, and that we train on HRF with an image size of `1024x1024`.
-In order to train on a single GPU, we use gradient accumulation in that case.
-
-## 2.1 Full-resolution W-Net variants
-
-The second W-Net stage can use the original Little U-Net, the full
-full-resolution/multi-resolution FR-U2 architecture, or its fixed-width Lite
-variant:
-
-| Selection | U2 architecture |
-|---|---|
-| no FR flag | Original Little U-Net (backward-compatible default) |
-| `--u2_arch fr_multi` | Full FR-U2, five interaction stages, dilations `1,2,4,2,1` |
-| `--fr_lite` | FR-U2-Lite, 4/8/16 channels, three interaction stages, dilations `1,2,1` |
-
-`--fr_lite` is sufficient by itself and resolves the saved configuration to
-`u2_arch=fr_multi` with effective Lite values. User-supplied full-FR width and
-dilation options are ignored for Lite and are serialized as `4` and
-`[1,2,1]`. Lite and full FR do not support A1 cross-stage bridges; use
-`--cross_stage_bridge none`.
-
-Example Lite training command:
-
-```
-python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 20/50
-                         --model_name wnet --fr_lite --save_path wnet_drive_fr_lite
-                         --device cuda:0 --seed 0
+```bash
+python get_public_data_smart.py
 ```
 
-Inference scripts recover `u2_arch` and `fr_lite` automatically from the saved
-`config.cfg`, so no Lite-specific inference flag is required:
+It populates `data/` with public datasets. The LES-AV download now requires a manual step described in `get_public_data.py`. Windows users should inspect `get_public_data_windows.py` and `get_public_data_smart.py` before running a downloader. A prepared dataset normally contains `images`, `mask`, `manual`, and `test_all.csv`. Training datasets also contain `train.csv`, `val.csv`, and `test.csv`; A/V datasets may contain `manual_av`, `test_all_av.csv`, and the corresponding `*_av.csv` splits. DRIVE may include `ZoneB_manual`; HRF training may include resized image, mask, and manual directories.
 
-```
-python generate_results.py --config_file experiments/wnet_drive_fr_lite/config.cfg
-                           --dataset DRIVE --device cuda:0
-```
+## Original LwNet Walkthrough
 
-The FR-Lite and full-FR options select architectures; they do not by
-themselves establish segmentation-quality improvements. Use matched seeds,
-training schedules, checkpoint-selection policies, preprocessing, splits, and
-threshold calibration when comparing variants.
+The original model is a two-stage W-Net: U-Net 1 predicts an intermediate vessel representation and U-Net 2 refines it. The default `wnet` architecture remains the original Little U-Net second stage.
 
-## 2.2 Gated cross-stage decoder bridges (A1)
+### Train Vessel Models
 
-The W-Net can optionally give U-Net 2 direct access to U-Net 1's multi-scale decoder
-representations through zero-initialized gated residual bridges. At each selected decoder
-stage `i`, the U2 feature is updated as `u2_feature_i = u2_feature_i + alpha_i * u1_feature_i`,
-where `alpha_i` is a learned gate initialized to exactly zero. Before any training update the
-bridged model therefore reproduces the original W-Net exactly.
+Training defaults to CPU and requires a save path. `--cycle_lens C/E` means `C` cycles of `E` epochs. These commands reproduce the original training layouts, subject to the original data, hardware, and preprocessing:
 
-Three training options control the bridge:
-
-| Option | Meaning |
-|---|---|
-| `--cross_stage_bridge none|scalar|channel` | `none` (default) is the legacy architecture; `scalar` adds one gate per selected scale; `channel` adds one gate per channel per scale. |
-| `--cross_stage_bridge_scales all|quarter,half,full` | Which decoder scales to bridge. `all` canonicalizes to `half,full` for `wnet` and `quarter,half,full` for `big_wnet`. |
-| `--cross_stage_bridge_init 0.0` | Initial raw gate value; the A1 default is exactly `0.0`. |
-
-Primary experiment (pair it against an identical control with `--cross_stage_bridge none`):
-
-```
-python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 20/50 --model_name wnet --cross_stage_bridge scalar --cross_stage_bridge_scales all --cross_stage_bridge_init 0.0 --checkpoint_interval epoch --metric auc,dice,loss --batch_size 4 --im_size 512 --device cuda:0 --save_path wnet_drive_a1_scalar_all_seed0 --seed 0
+```bash
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 20/50 --model_name wnet --save_path wnet_drive --device cuda:0
+python train_cyclical.py --csv_train data/CHASEDB/train.csv --cycle_lens 40/50 --model_name wnet --save_path wnet_chasedb --device cuda:0
+python train_cyclical.py --csv_train data/HRF/train.csv --cycle_lens 30/50 --model_name wnet --save_path wnet_hrf_1024 --im_size 1024 --batch_size 2 --grad_acc_steps 1 --device cuda:0
 ```
 
-Inference requires no new bridge flags: when `--config_file` (or a model directory containing
-`config.cfg`) is supplied, the bridge architecture is recovered automatically and the checkpoint
-is loaded strictly.
+The resulting experiment directories are normally `experiments/wnet_drive`, `experiments/wnet_chasedb`, and `experiments/wnet_hrf_1024`. The original schedule uses batch size 4; HRF uses 1024x1024 images and gradient accumulation for a single GPU.
 
-## 4. Generating segmentations
-Once the model is trained, you can produce the corresponding segmentations calling `generate_results.py` and specifying which dataset should be used:
-```
-python generate_results.py --config_file experiments/wnet_drive/config.cfg
-                           --dataset DRIVE --device cuda:0
-python generate_results.py --config_file experiments/wnet_chasedb/config.cfg
-                           --dataset CHASEDB --device cuda:0
-python generate_results.py --config_file experiments/wnet_hrf_1024/config.cfg
-                           --dataset HRF --im_size 1024 --device cuda:0
-```
-The above stores the predictions for those datasets in `results/DRIVE/experiments/wnet_drive`, `results/CHASEDB/experiments/wnet_chasedb`, and `results/HRF/experiments/wnet_hrf_1024` respectively.
+### Generate Vessel Segmentations
 
-## 5. Computing Performance
-We call `analyze_results.py` to compute performance.
-It is important to specify what was the training and what is the test set here.
-For that, you pass the path to the train/test predictions, and the name of the train/test datasets:
-```
-python analyze_results.py --path_train_preds results/DRIVE/experiments/wnet_drive
-                          --path_test_preds results/DRIVE/experiments/wnet_drive
-                          --train_dataset DRIVE --test_dataset DRIVE
-
-python analyze_results.py --path_train_preds results/CHASEDB/experiments/wnet_chasedb
-                          --path_test_preds results/CHASEDB/experiments/wnet_chasedb
-                          --train_dataset CHASEDB --test_dataset CHASEDB
-
-python analyze_results.py --path_train_preds results/HRF/experiments/wnet_hrf_1024
-                          --path_test_preds results/HRF/experiments/wnet_hrf_1024
-                          --train_dataset HRF --test_dataset HRF
-```
-The code uses the csv files in each dataset folder to check which images should be used for running an AUC analysis in the training set and finding an optimal binarizing threshold to be used in the test set images.
-## 6. Cross-Dataset Experiments
-When a model has been trained on dataset A (say, DRIVE) and we want to test it on dataset B (say, CHASE-DB), we first generate segmentations on both datasets:
-```
-python generate_results.py --config_file experiments/wnet_drive/config.cfg
-                           --dataset DRIVE  --device cuda:0
-python generate_results.py --config_file experiments/wnet_drive/config.cfg
-                           --dataset CHASEDB  --device cuda:0
-```
-and then we compute performance:
-```
-python analyze_results.py --path_train_preds results/DRIVE/experiments/wnet_drive
-                          --path_test_preds results/CHASEDB/experiments/wnet_drive
-                          --train_dataset DRIVE --test_dataset CHASEDB
+```bash
+python generate_results.py --config_file experiments/wnet_drive/config.cfg --dataset DRIVE --device cuda:0
+python generate_results.py --config_file experiments/wnet_chasedb/config.cfg --dataset CHASEDB --device cuda:0
+python generate_results.py --config_file experiments/wnet_hrf_1024/config.cfg --dataset HRF --im_size 1024 --device cuda:0
 ```
 
-## 7. Training with pseudo-labels and computing performance
-1) Train a model on a source dataset (DRIVE); this will store the model in `experiments/wnet_drive`
-```
-python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 20/50
-                         --model_name wnet --save_path wnet_drive
-                         --device cuda:0
-```
-2) Generate predictions on target dataset (CHASEDB) with this model; this will store predictions at `results/CHASEDB/experiments/wnet_drive`
-```
-python generate_results.py --config_file experiments/wnet_drive/config.cfg
-                           --dataset CHASEDB --device cuda:0
+Predictions are written below `results/<dataset>/experiments/<experiment>`, unless `--result_path` changes the root.
+
+### Compute Performance
+
+The evaluation uses training predictions to select a threshold and test predictions for the reported metrics. Keep the dataset CSV splits unchanged when comparing runs:
+
+```bash
+python analyze_results.py --path_train_preds results/DRIVE/experiments/wnet_drive --path_test_preds results/DRIVE/experiments/wnet_drive --train_dataset DRIVE --test_dataset DRIVE
+python analyze_results.py --path_train_preds results/CHASEDB/experiments/wnet_chasedb --path_test_preds results/CHASEDB/experiments/wnet_chasedb --train_dataset CHASEDB --test_dataset CHASEDB
+python analyze_results.py --path_train_preds results/HRF/experiments/wnet_hrf_1024 --path_test_preds results/HRF/experiments/wnet_hrf_1024 --train_dataset HRF --test_dataset HRF
 ```
 
-3) Train a model on DRIVE manual segmentations plus CHASEDB pseudo-segmentations for one cycle of 10 epochs with a lower learning rate, starting from the weights of the model trained on DRIVE.
-Note that in this case we use the AUC on the training set as checkpointing criterion.
-This training is slower because of the AUC computation on a large set of images at the end of each cycle.
-In this case, we save the new model in a  folder called `wnet_drive_chasedb_pl`:
-```
-python train_cyclical.py --save_path wnet_drive_chasedb_pl
-                         --checkpoint_folder experiments/wnet_drive
-                         --csv_test data/CHASEDB/test_all.csv
-                         --path_test_preds results/CHASEDB/experiments/wnet_drive
-                         --max_lr 0.0001 --cycle_lens 10/1 --metric tr_auc
-                         --device cuda:0
+### Cross-Dataset Evaluation
+
+Generate predictions on both the training source dataset and the target dataset, then pass the source predictions as `--path_train_preds`:
+
+```bash
+python generate_results.py --config_file experiments/wnet_drive/config.cfg --dataset DRIVE --device cuda:0
+python generate_results.py --config_file experiments/wnet_drive/config.cfg --dataset CHASEDB --device cuda:0
+python analyze_results.py --path_train_preds results/DRIVE/experiments/wnet_drive --path_test_preds results/CHASEDB/experiments/wnet_drive --train_dataset DRIVE --test_dataset CHASEDB
 ```
 
-3) Generate predictions with this new model on source dataset DRIVE:
-```
-python generate_results.py --config_file experiments/wnet_drive_chasedb_pl/config.cfg
-                           --dataset DRIVE --device cuda:0
+### Pseudo-Label Training
+
+First train a source model and generate target predictions:
+
+```bash
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 20/50 --model_name wnet --save_path wnet_drive --device cuda:0
+python generate_results.py --config_file experiments/wnet_drive/config.cfg --dataset CHASEDB --device cuda:0
 ```
 
-4) Generate predictions on target dataset CHASEDB:
-```
-python generate_results.py --config_file experiments/wnet_drive_chasedb_pl/config.cfg
-                           --dataset CHASEDB --device cuda:0
+Then train using source labels plus target pseudo-labels. `--checkpoint_folder` initializes weights; it is not a general optimizer/training-state resume:
+
+```bash
+python train_cyclical.py --save_path wnet_drive_chasedb_pl --checkpoint_folder experiments/wnet_drive --csv_test data/CHASEDB/test_all.csv --path_test_preds results/CHASEDB/experiments/wnet_drive --max_lr 0.0001 --cycle_lens 10/1 --metric tr_auc --device cuda:0
+python generate_results.py --config_file experiments/wnet_drive_chasedb_pl/config.cfg --dataset DRIVE --device cuda:0
+python generate_results.py --config_file experiments/wnet_drive_chasedb_pl/config.cfg --dataset CHASEDB --device cuda:0
+python analyze_results.py --path_train_preds results/DRIVE/experiments/wnet_drive --path_test_preds results/CHASEDB/experiments/wnet_drive_chasedb_pl --train_dataset DRIVE --test_dataset CHASEDB
 ```
 
-5) Analyze results: we use DRIVE predictions to find optimal thresholding value:
-```
-python analyze_results.py --path_train_preds results/DRIVE/experiments/wnet_drive
-                          --path_test_preds results/CHASEDB/experiments/wnet_drive_chasedb_pl
-                          --train_dataset DRIVE --test_dataset CHASEDB
+### Evaluate Your Own Model
+
+Place probabilistic PNG predictions in separate training and test directories. Filenames must match the retinal image names. Use the training predictions to calibrate the threshold:
+
+```bash
+python analyze_results.py --path_train_preds train_preds --path_test_preds test_preds --train_dataset dataset_A --test_dataset dataset_B
 ```
 
-## 8. Evaluating your own model
-We have made also an effort in making our evaluation protocol easy to use.
-You just need to build your own probabilistic segmentations with your segmentation system and store training/test predictions in folders called `train_preds` and `trest_preds`.
+Use the same train/test split CSVs as the dataset definition; otherwise the evaluation can accidentally include training images.
 
-Be careful: you need to produce segmentations for the test dataset, and also for the training dataset, which we use to find an optimal threshold.
-Then you can call our code to compute performance.
-If you used dataset `dataset_A` for training and you want to test on `dataset_B`, you would run:
-```
-python analyze_results.py --path_train_preds train_preds --path_test_preds test_preds
-                          --train_dataset dataset_A --test_dataset dataset_B
-```
+### Artery/Vein Training
 
-Be very careful to use the same train/test splits as we are using here (check the csvs in the corresponding dataset folder), or you might be testing on training data.
-Also, predictions should have the same exact name as the corresponding retinal images, but with a `.png` extension (otherwise the code will not find them).
+The original A/V workflow uses the larger `big_wnet` model. The current CLI option is `--cycle_lens` (plural):
 
-## 9. Training a W-Net for Artery/Vein segmentation
-In our work we train models on DRIVE and HRF, and we use a larger W-Net in this task.
-Again, HRF is trained at image size `1024x1024`:
-```
-python train_cyclical.py --csv_train data/DRIVE/train_av.csv --model_name big_wnet
-                         --cycle_len 40/50 --do_not_save False --save_path big_wnet_drive_av
-                         --device cuda:0
+```bash
+python train_cyclical.py --csv_train data/DRIVE/train_av.csv --model_name big_wnet --cycle_lens 40/50 --do_not_save False --save_path big_wnet_drive_av --device cuda:0
+python train_cyclical.py --csv_train data/HRF/train_av.csv --model_name big_wnet --cycle_lens 40/50 --do_not_save False --save_path big_wnet_hrf_av_1024 --im_size 1024 --batch_size 2 --grad_acc_steps 1 --device cuda:0
 ```
 
-```
-python train_cyclical.py --csv_train data/HRF/train_av.csv --model_name big_wnet
-                         --cycle_len 40/50 --do_not_save False --save_path big_wnet_hrf_av_1024
-                         --im_size 1024 --batch_size 2 --grad_acc_steps 1  --device cuda:0
+### Artery/Vein Inference
+
+```bash
+python generate_av_results.py --config_file experiments/big_wnet_drive_av/config.cfg --dataset DRIVE --device cuda:0
+python generate_av_results.py --config_file experiments/big_wnet_drive_av/config.cfg --dataset LES_AV --device cuda:0
+python generate_av_results.py --config_file experiments/big_wnet_hrf_av_1024/config.cfg --dataset HRF --im_size 1024 --device cuda:0
 ```
 
-## 10. Generating Artery/Vein segmentations
-This is similar to the vessel segmentation case, but calling `generate_av_results.py` instead::
-```
-python generate_av_results.py --config_file experiments/big_wnet_drive_av/config.cfg
-                              --dataset DRIVE --device cuda:0
-python generate_av_results.py --config_file experiments/big_wnet_drive_av/config.cfg
-                              --dataset LES_AV --device cuda:0
-```
-and remember to set the image size for generating HRF segmentations:
-```
-python generate_av_results.py --config_file experiments/big_wnet_hrf_av_1024/config.cfg
-                              --dataset HRF --im_size 1024 --device cuda:0
+LES_AV is unavailable until its manual dataset preparation is completed.
+
+### One-Image Prediction
+
+For vessel prediction, provide a model directory, input image, and result directory. The FOV mask is optional:
+
+```bash
+python predict_one_image.py --model_path experiments/wnet_drive --im_path folder/my_image.jpg --result_path my_results --mask_path folder/my_mask.jpg --device cuda:0 --bin_thresh 0.42
+python predict_one_image.py --model_path experiments/wnet_hrf_1024 --im_path folder/my_image.jpg --result_path my_results --device cuda:0 --im_size 1024 --bin_thresh 0.3725
 ```
 
-## 11. Generating vessel and A/V segmentations on your own data
-To make it easy to construct segmentations on new data, we have also made available pretrained weights in the `experiments/` folder, and a script you can call on your own images:
-```
-python predict_one_image.py --model_path experiments/wnet_drive/
-                            --im_path folder/my_image.jpg
-                            --result_path my_results/
-                            --mask_path folder/my_mask.jpg
-                            --device cuda:0
-                            --bin_thresh 0.42
-```
-The script uses a model trained on DRIVE by default, you can change it to
-use a model that you would have trained on HRF (larger resolution but slower, see below).
-You can optionally pass the path to a FOV mask (if you do not, the code builds one for you),
-the device used for the forward pass of the network (defaults to CPU), and the binarizing threshold
-(by default set to the optimal one in the DRIVE training set, 0.42).
-If for instance you want to use a model trained on HRF, you will want to change the image size and the threshold as follows:
-```
-python predict_one_image.py --model_path experiments/wnet_hrf_1024/
-                            --im_path folder/my_image.jpg
-                            --result_path my_results/
-                            --device cuda:0
-                            --im_size 1024
-                            --bin_thresh 0.3725
-```
-If you are interested in generating A/V segmentations, you can use a second script called `predict_one_image_av.py`.
-The usage is very similar (on the CPU in this case, automatic mask computing):
-```
-python predict_one_image_av.py --model_path experiments/big_wnet_drive/
-                              --im_path folder/my_image.jpg
-                              --result_path my_results/
-```
-Note that there is no need to supply a threshold in this case, since we take the argmax of the probabilities to generate hard segmentations.
+For A/V prediction:
 
-If instead you want to use a model trained on HRF (also provided) at a larger resolution of 1024x1024, you would run:
+```bash
+python predict_one_image_av.py --model_path experiments/big_wnet_drive_av --im_path folder/my_image.jpg --result_path my_results
+python predict_one_image_av.py --model_path experiments/big_wnet_hrf_av_1024 --im_path folder/my_image.jpg --result_path my_results --im_size 1024
 ```
-python predict_one_image_av.py --model_path experiments/big_wnet_hrf_av_1024/ 
-                               --im_path folder/my_image.jpg 
-                               --result_path my_results/
-                               --im_size 1024
+
+The A/V script uses an argmax rather than a vessel binarization threshold. The original pretrained files and their performance are not evidence of new fork results.
+
+## Fork Extensions
+
+The following options are implemented in this checkout and are documented separately from the original walkthrough. They are optional experiments, not validated improvements. Every observed statement below is qualitative because no controlled numerical comparison is claimed here.
+
+### Checkpoint Selection
+
+Checkpoint checks run at cycle boundaries by default. `0` retains cycle-only checks; `1` starts epoch-level checks in the first cycle. Ordered metrics support near-tie policies:
+
+```bash
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 2/2 --model_name wnet --save_path wnet_drive_checkpoint --metric auc,dice,loss --epoch_checkpointing_from 1 --metric_tolerances auc=0.0005,dice=0.0001,loss=0.000001 --device cpu
 ```
-Using this model should result in finer arteries and veins delineations (although not necessarily more accuracy), which may be desirable if your data is of higher resolution than DRIVE.
 
-## Structural-Saliency Self-Supervision
+Expected effect: more frequent or multi-metric selection can choose a different checkpoint than cycle-only AUC selection. Observed outcome: selection metadata records the chosen policy and diagnostics; no fork-specific score improvement is asserted.
 
-LwNet supports an optional auxiliary **structural-saliency self-supervision** task,
-inspired by the RaffeSDG structural-saliency pretext task. It is **not** the full
-RaffeSDG coupling architecture: no attention coupling is implemented.
+### FreeSDG, FMAug, and RAFFE Modes
 
-During training, the network receives the (frequency-)augmented image, while a
-Gaussian high-frequency-content (HFC) target is constructed from the
-geometrically aligned **original** (non-frequency-augmented) RGB image. An
-auxiliary decoder branching from U-Net 1's encoder reconstructs that target, and
-the reconstruction is supervised with a plain mean-squared error:
+FreeSDG frequency augmentation is opt-in and preserves the baseline path when omitted. The mode choices are `fmaug`, `fixed_hfc`, `random_hfc`, `raffe_filter`, and `raffe_smooth_mix`:
 
-`
-L = Lseg(U1) + Lseg(U2) + lambda_sal * Lmse
-`
+```bash
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 2/2 --model_name wnet --freesdg --freesdg_aug_mode fmaug --freesdg_test_input raw --save_path wnet_drive_freesdg --device cpu --seed 0
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 2/2 --model_name wnet --freesdg --freesdg_aug_mode raffe_smooth_mix --freesdg_test_input raw --save_path wnet_drive_raffe --device cpu --seed 0
+```
 
-Key properties:
+Expected effect: frequency-domain views change the training input distribution while keeping paired masks aligned. Observed outcome: these modes are available and covered by smoke tests; no controlled performance claim is made.
 
-1. the auxiliary decoder branches from U-Net 1's encoder and shares its
-   bottleneck and skip features;
-2. the structural target is a three-channel Gaussian HFC representation of the
-   aligned original image (range [-1, +1], exactly -1 outside the FOV);
-3. reconstruction uses 	orch.nn.functional.mse_loss (reduction='mean');
-4. the auxiliary decoder executes **only during training** (never during
-   validation or inference);
-5. the decoder's parameters remain in the saved checkpoint, so inference must
-   reconstruct the architecture from the saved config (handled automatically by
-   get_arch_options/get_arch);
-6. prediction output is still U-Net 2's vessel logits only.
+### Loss Compositions
 
-Enable it with --structural_saliency (weight --structural_saliency_weight,
-default 1.0; Gaussian kernel --structural_saliency_kernel/--structural_saliency_sigma,
-defaults 27/9.0; HFC ratio --structural_saliency_ratio, default 4.0). It works
-with or without --freesdg, and with every supported augmentation mode, so the
-ablation RAFFE vs RAFFE + structural saliency is directly comparable.
+The loss is `w_bce*BCE + w_dice*Dice + w_cldice*clDice + w_boundary*boundary`. Weights are independent and default to the original BCE behavior:
+
+```bash
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 2/2 --model_name wnet --loss_bce_weight 1.0 --loss_dice_weight 0.5 --loss_cldice_weight 0.1 --loss_boundary_weight 0.0 --save_path wnet_drive_losses --device cpu
+```
+
+Expected effect: Dice and topology terms emphasize foreground overlap and connectivity; the boundary term is resolution-dependent. Observed outcome: component values and weighted contributions are reported during training; no numerical improvement is claimed.
+
+### Auxiliary Structural Saliency
+
+This is an auxiliary reconstruction task inspired by RaffeSDG. It uses the geometrically aligned original RGB image to build a Gaussian high-frequency target and branches from U-Net 1. It is not the full RaffeSDG attention-coupling architecture, and it does not add a second segmentation view:
+
+```bash
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 2/2 --model_name wnet --structural_saliency --structural_saliency_weight 1.0 --structural_saliency_kernel 27 --structural_saliency_sigma 9.0 --structural_saliency_ratio 4.0 --save_path wnet_drive_saliency --device cpu
+```
+
+Expected effect: the auxiliary target adds a reconstruction objective during training only. Observed outcome: the saliency decoder is saved and reconstructed from `config.cfg`; inference still returns U-Net 2 vessel logits only.
+
+### Gated Cross-Stage Bridges
+
+Bridges reuse selected U-Net 1 decoder features in U-Net 2 through learned residual gates. Gates start at zero, so the initial forward path matches the original W-Net:
+
+```bash
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 2/2 --model_name wnet --cross_stage_bridge scalar --cross_stage_bridge_scales all --cross_stage_bridge_init 0.0 --epoch_checkpointing_from 1 --metric auc,dice,loss --save_path wnet_drive_bridge --device cpu --seed 0
+```
+
+Expected effect: training can learn multi-scale feature reuse between stages. Observed outcome: scalar and channel bridge variants instantiate and round-trip through checkpoints; FR-U2 and FR-U2-Lite are incompatible with these bridges and must use `--cross_stage_bridge none`.
+
+### FR-U2 and FR-U2-Lite
+
+These alternatives replace only the second-stage Little U-Net. FR-U2 is a full-resolution multi-resolution model; Lite uses fixed 4/8/16 channel widths and a shorter interaction schedule:
+
+```bash
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 2/2 --model_name wnet --u2_arch fr_multi --fr_u2_base_channels 8 --fr_u2_dilations 1,2,4,2,1 --cross_stage_bridge none --save_path wnet_drive_fr --device cpu
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 2/2 --model_name wnet --fr_lite --cross_stage_bridge none --save_path wnet_drive_fr_lite --device cpu
+```
+
+Expected effect: FR-U2 variants change capacity and full-resolution feature interaction, while Lite reduces width and depth. Observed outcome: both architectures instantiate and recover their settings from `config.cfg`; no fork-specific segmentation gain is claimed.
+
+### Damped Cosine Scheduler
+
+This checkout retains the original `CosineAnnealingLR` scheduler. It has no `utils/schedulers.py` and no `--scheduler damped_cosine` CLI option, so no damped-cosine command is available on this branch. Do not combine scheduler flags with the FreeSDG examples above. If the separate `damped_cosine` branch is checked out, consult that branch's `--help` before using its scheduler-specific command.
+
+The separate scheduler work describes a full cosine oscillation with an envelope: `alpha > 0` damps peaks, `alpha = 0` removes damping but is not the original cosine scheduler, and `-1 < alpha < 0` inflates peaks subject to an optional cap. The default cosine behavior in this branch is unchanged.
+
+## Compatibility and Caveats
+
+- `save_path` writes `config.cfg` and checkpoint files into the selected experiment directory. Reusing a directory can overwrite prior outputs; use a new directory for each run.
+- The original evaluation protocol depends on dataset CSV splits, preprocessing, and threshold calibration. Do not compare different protocols as if they were equivalent.
+- `--checkpoint_folder` loads model weights for pseudo-label training but does not resume optimizer, scheduler, or arbitrary training state.
+- FreeSDG, saliency, loss, bridge, and FR-U2 options preserve original defaults when omitted.
+- LES_AV and some public-data steps require manual downloads or external command-line tools.
+- No fork-specific numerical result is claimed here without a traceable, controlled experiment table.

@@ -82,7 +82,7 @@ def validate_cross_stage_bridge(cross_stage_bridge, cross_stage_bridge_scales, c
 def validate_structural_saliency(structural_saliency, model_name, n_classes, in_c,
                                  structural_saliency_weight, structural_saliency_kernel,
                                  structural_saliency_sigma, structural_saliency_ratio):
-    """Validate structural-saliency self-supervision settings (plan §3).
+    """Validate structural-saliency self-supervision settings.
 
     Only called when ``structural_saliency`` is enabled.  Raises ``ValueError``
     with an explicit explanation for every invalid condition.

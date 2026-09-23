@@ -49,12 +49,12 @@ class TrainDataset(Dataset):
         # at the supervised output resolution). Derived only from
         # loss_boundary_weight > 0; never from --freesdg.
         self.need_distance_map = need_distance_map
-        # Structural-saliency self-supervision (plan §19): when True, each
+        # Structural-saliency self-supervision: when True, each
         # training sample additionally returns a geometrically synchronized
         # raw RGB reference and its FOV mask. Training-only; never set for
         # validation.
         self.need_structural_saliency = need_structural_saliency
-        # Opt-in FreeSDG FMAug configuration (plan §10). None/disabled ->
+        # Opt-in FreeSDG FMAug configuration. None/disabled ->
         # the original code path below executes verbatim.
         self.freesdg_cfg = freesdg_cfg
         self.freesdg_resize = None  # hoisted deterministic resize (set by get_train_val_datasets)
@@ -87,7 +87,7 @@ class TrainDataset(Dataset):
         return self._freesdg_augmentor
 
     def _freesdg_mask_pil(self, mask, hw):
-        # NEAREST resize keeps the FOV mask binary (plan §10.1/§15)
+        # NEAREST resize keeps the FOV mask binary.
         if self._freesdg_mask_resize is None:
             self._freesdg_mask_resize = p_tr.Resize(hw, interpolation=InterpolationMode.NEAREST)
         elif self._freesdg_mask_resize.size != hw:
@@ -101,7 +101,7 @@ class TrainDataset(Dataset):
             self, network_img, segmentation_target, structural_raw_img,
             structural_fov_mask, transforms=None):
         # Replay the exact same random transform realization on the raw RGB
-        # reference and its FOV mask (plan §13). The second transform call must
+        # reference and its FOV mask. The second transform call must
         # not advance the global RNG permanently.
         before = _capture_transform_rng_state()
         transforms = transforms or self.transforms
@@ -148,7 +148,7 @@ class TrainDataset(Dataset):
         structural_mask = None
 
         if self._freesdg_enabled() and self.freesdg_cfg.get('role', 'train') == 'train':
-            # FMAug training path (plan §1.4/§10.1): hoisted deterministic
+            # FMAug training path: hoisted deterministic
             # resize of image+target, NEAREST-resized FOV mask, FMAug on the
             # [0,1] image, uint8 PIL round-trip (~1/255 quantization, §19.6),
             # then exactly the remaining original transform order.
@@ -202,7 +202,7 @@ class TrainDataset(Dataset):
                     img, target = selected_transforms(img, target)
         elif self._freesdg_enabled() and self.freesdg_cfg.get('role') == 'val' \
                 and self.freesdg_cfg.get('test_input', 'raw') == 'anchor':
-            # Validation anchor path (plan §7/§10.2): deterministic Resize +
+            # Validation anchor path: deterministic Resize +
             # ToTensor as before, then fixed-anchor HFC on the float [0,1]
             # tensor (no uint8 round-trip on evaluation paths, §8).
             img, target = self.transforms(img, target)
@@ -355,7 +355,7 @@ def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), lab
         # The deterministic resize is hoisted ahead of FMAug in
         # TrainDataset.__getitem__ (same resize instance/interpolations);
         # the remaining original transform order is kept verbatim (§10.1).
-        # Diagnostic profile (plan M4): 'flips_only' disables LwNet's
+        # Diagnostic profile: 'flips_only' disables LwNet's
         # scale/translation/rotation and ColorJitter after FMAug, keeping
         # only the flips + tensor conversion. The vanilla baseline
         # transforms are never altered.

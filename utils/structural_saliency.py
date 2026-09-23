@@ -6,7 +6,7 @@ range.  The module is self-contained: it knows nothing about FreeSDG, Raffe,
 augmentation modes, or the training script.  It receives an RGB image and a
 binary FOV mask and returns a three-channel reconstruction target in [-1, +1].
 
-Target definition (plan §5-§8):
+Target definition:
     * median-fill the background (median over ALL pixels + 0.2),
     * replication-padded depthwise Gaussian blur,
     * residual = ratio * (filled - blurred), clamped to [-1, +1],
@@ -25,7 +25,7 @@ import torch.nn.functional as F
 def build_gaussian_kernel2d(kernel_size, sigma):
     """Build a normalized 2D Gaussian kernel of shape [1, 1, K, K].
 
-    Constructed in float64, normalized, then cast to float32 (plan §6).  The
+    Constructed in float64, normalized, then cast to float32. The
     1D Gaussian is ``g(x) = exp(-x^2 / (2 sigma^2))`` over the integer
     coordinate range ``-(K//2) .. +(K//2)``, normalized to sum 1, and the 2D
     kernel is the outer product, normalized once more.
@@ -44,7 +44,7 @@ def build_gaussian_kernel2d(kernel_size, sigma):
 
 
 class StructuralSaliencyTarget(nn.Module):
-    """Gaussian HFC structural-saliency reconstruction target (plan §4-§10).
+    """Gaussian HFC structural-saliency reconstruction target.
 
     ``forward(image01, mask01)`` returns a ``[B, 3, H, W]`` tensor in
     ``[-1, +1]``: the amplified high-frequency residual inside the FOV and
@@ -88,25 +88,25 @@ class StructuralSaliencyTarget(nn.Module):
 
         b, c, h, w = image01.shape
 
-        # Median fill outside the FOV (plan §5.1): median over ALL pixels,
+        # Median fill outside the FOV: median over ALL pixels,
         # + 0.2, then replace background pixels. The +0.2 offset is
         # intentionally unclamped, so a bright image (median near 1.0) yields
         # a background fill slightly above the nominal [0,1] range; this
         # matches the original RaffeSDG HFC implementation and is harmless
-        # because the final target is clamped to [-1, +1] (plan §8).
+        # because the final target is clamped to [-1, +1].
         median = image01.flatten(2).median(dim=2).values
         median = median.view(b, c, 1, 1)
         median = median + 0.2
         x_filled = image01 * mask01 + median * (1.0 - mask01)
 
-        # Replication-padded depthwise Gaussian convolution (plan §7).
+        # Replication-padded depthwise Gaussian convolution.
         padding = self.kernel_size // 2
         padded = F.pad(x_filled, (padding, padding, padding, padding),
                        mode='replicate')
         kernel = self.kernel.to(device=x_filled.device, dtype=x_filled.dtype)
         blurred = F.conv2d(padded, kernel.repeat(c, 1, 1, 1), groups=c)
 
-        # HFC residual (plan §8).
+        # HFC residual.
         residual = self.ratio * (x_filled - blurred)
         residual = torch.clamp(residual, -1.0, 1.0)
         target = (residual + 1.0) * mask01 - 1.0

@@ -30,7 +30,7 @@ parser.add_argument('--im_size', help='delimited list input, could be 600,400', 
 parser.add_argument('--device', type=str, default='cpu', help='where to run the training code (e.g. "cpu" or "cuda:0") [default: %(default)s]')
 parser.add_argument('--in_c', type=int, default=3, help='channels in input images')
 parser.add_argument('--result_path', type=str, default='results', help='path to save predictions (defaults to results')
-# FreeSDG FMAug eval-input override (plan §12): None means "use the training
+# FreeSDG FMAug eval-input override: None means "use the training
 # config value, falling back to raw"; explicit values override the config.
 parser.add_argument('--freesdg_test_input', type=str, default=None, choices=['raw', 'anchor'], help='override FreeSDG eval input policy (raw/anchor); default: training-config value or raw')
 
@@ -100,7 +100,7 @@ if __name__ == '__main__':
     '''
 
     args = parser.parse_args()
-    # capture before the config file overwrites the argparse namespace (§12)
+    # Capture the CLI override before the config file overwrites the namespace.
     cli_freesdg_test_input = args.freesdg_test_input
 
     if args.device.startswith("cuda"):
@@ -129,7 +129,7 @@ if __name__ == '__main__':
     model_name = args.model_name
     in_c = args.in_c
 
-    # FreeSDG eval-input resolution (plan §12): CLI value -> training-config
+    # FreeSDG eval-input resolution: CLI value -> training-config
     # value -> raw. Anchor preprocessing applies only when the training config
     # indicates FreeSDG AND the resolved policy is 'anchor'.
     cfg_freesdg = bool(args.__dict__.get('freesdg', False))
@@ -143,7 +143,7 @@ if __name__ == '__main__':
     if freesdg_test_input == 'anchor' and not cfg_freesdg:
         print("* WARNING: --freesdg_test_input anchor requested, but the training "
               "config has no active FreeSDG fields (freesdg=false or absent); "
-              "anchor preprocessing is skipped and raw input is used (plan §29.2).")
+              "anchor preprocessing is skipped and raw input is used.")
 
     if experiment_path is None: raise Exception('must specify path to experiment')
 
@@ -174,10 +174,10 @@ if __name__ == '__main__':
     save_results_path = osp.join(args.result_path, dataset, experiment_path)
     print('* Saving predictions to ' + save_results_path)
 
-    # FreeSDG fixed-anchor inference preprocessing (plan §12/§15): float only,
+    # FreeSDG fixed-anchor inference preprocessing is float-only,
     # no uint8 round-trip; applied once per image before the existing flip
     # TTA, which is valid because the Gaussian kernel and mask operations are
-    # reflection-equivariant under the existing TTA flips (plan §12.1).
+    # reflection-equivariant under the existing TTA flips.
     if use_freesdg_anchor:
         from utils.freesdg_aug import FreeSDGAugmentor
         from torchvision.transforms import functional as tvF

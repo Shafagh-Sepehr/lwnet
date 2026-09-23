@@ -27,7 +27,7 @@ parser.add_argument('--bin_thresh', type=float, default='0.4196', help='binarizi
 parser.add_argument('--im_size', help='delimited list input, could be 600,400', type=str, default='512')
 parser.add_argument('--device', type=str, default='cpu', help='where to run the training code (e.g. "cpu" or "cuda:0") [default: %(default)s]')
 parser.add_argument('--result_path', type=str, default=None, help='path to save prediction)')
-# FreeSDG FMAug eval-input override (plan §13): None -> config value -> raw
+# FreeSDG FMAug eval-input override: None -> config value -> raw
 parser.add_argument('--freesdg_test_input', type=str, default=None, choices=['raw', 'anchor'], help='override FreeSDG eval input policy (raw/anchor); default: model config value or raw')
 
 from skimage import measure, draw
@@ -160,7 +160,7 @@ if __name__ == '__main__':
     bin_thresh = args.bin_thresh
     tta = args.tta
 
-    # FreeSDG preprocessing recovery from model_path/config.cfg (plan §13):
+    # Recover FreeSDG preprocessing settings from model_path/config.cfg:
     # the config is used ONLY to recover FreeSDG-related preprocessing fields;
     # resolution: CLI override -> config value -> raw fallback. No config ->
     # FreeSDG disabled, existing behavior.
@@ -181,7 +181,7 @@ if __name__ == '__main__':
     if freesdg_test_input == 'anchor' and not cfg_freesdg:
         print('* WARNING: --freesdg_test_input anchor requested, but the model '
               'config has no active FreeSDG fields (freesdg=false or absent); '
-              'anchor preprocessing is skipped and raw input is used (plan §29.2).')
+              'anchor preprocessing is skipped and raw input is used.')
 
     model_name = model_cfg.get('model_name', 'wnet')
     in_c = model_cfg.get('in_c', 3)
@@ -227,7 +227,7 @@ if __name__ == '__main__':
     im_tens = tr(img)  # only transform image
 
     if use_freesdg_anchor:
-        # Anchor flow (plan §13/§15): existing FOV, crop consistent with the
+        # Anchor flow uses the existing FOV and an image-consistent crop,
         # image, NEAREST resize, fixed-anchor HFC (float, no uint8 round-trip),
         # then the existing W-Net/TTA path.
         from utils.freesdg_aug import FreeSDGAugmentor

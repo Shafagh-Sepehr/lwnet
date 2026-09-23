@@ -5,13 +5,13 @@ released repository's HFC filter bank, median background padding, Gaussian
 mixing, and fixed "anchor" HFC preprocessing, adapted to LwNet's dataset-side,
 per-sample augmentation pipeline.
 
-Range contract (plan §1.2/§1.3):
+Range contract:
     * Low-level filters (``median_padding``, ``HFCFilter``, ``GaussianMixUp``)
       accept and return tensors in [-1, 1] only.
     * Only ``FreeSDGAugmentor`` performs the [0,1] <-> [-1,1] conversions, so
       LwNet's W-Net keeps receiving [0,1] inputs.
 
-Randomness (plan §6):
+Randomness:
     * FMAug never consumes the global Python/NumPy/PyTorch RNG used by LwNet's
       existing paired transforms. ``FreeSDGAugmentor`` owns a dedicated
       ``random.Random(freesdg_seed)`` stream.
@@ -20,20 +20,20 @@ Randomness (plan §6):
       workers get independent streams (see ``fmaug_seed_for_worker``).
 
 Documented deviations from the released FreeSDG implementation (full log in
-docs/freesdg_deviations.md; plan §19):
-    * §19.1  W-Net receives [0,1], not FreeSDG's [-1,1] HFC representation.
-    * §19.2  FMAug is applied per sample in ``TrainDataset``; the released code
+docs/freesdg_deviations.md):
+    * W-Net receives [0,1], not FreeSDG's [-1,1] HFC representation.
+    * FMAug is applied per sample in ``TrainDataset``; the released code
               selects filters/rectangles once per batch. The dedicated-RNG draw
               order is therefore ours: filter i, filter j, then rectangle
               (upstream drew rectangle first).
-    * §19.4  ``repo`` and ``paper`` rectangle policies are kept strictly
+    * ``repo`` and ``paper`` rectangle policies are kept strictly
               separate; they are not reconciled.
-    * §19.5  ``paper`` policy interprets the rebuttal's singular patch "size"
+    * ``paper`` policy interprets the rebuttal's singular patch "size"
               as an s x s square, and requires 512x512 input (asserted).
-    * §19.6  ``FreeSDGAugmentor.to_pil_uint8`` introduces ~1/255 quantization
+    * ``FreeSDGAugmentor.to_pil_uint8`` introduces ~1/255 quantization
               on the *train* path only, because LwNet's paired transforms are
               PIL-based. Evaluation anchor processing stays float.
-    * §19.8  The filter bank contains exactly 20 filters: zip(range(5, 50, 2),
+    * The filter bank contains exactly 20 filters: zip(range(5, 50, 2),
               range(2, 22)) truncates at the shorter iterable.
     * §29.1  With ``num_workers > 0`` and ``persistent_workers=False`` the
               worker-local FMAug RNG restarts its sequence every epoch
@@ -51,7 +51,7 @@ import torch.nn.functional as F
 
 # Released FreeSDG filter bank: zip(range(5, 50, 2), range(2, 22)).
 # Python's zip terminates at the shorter iterable -> exactly 20 (width, sigma)
-# pairs: (5,2), (7,3), ..., (43,21). NOT 23 (plan §3.1/§19.8).
+# pairs: (5,2), (7,3), ..., (43,21). The shorter range limits the bank to 20.
 FREESDG_FILTER_BANK = tuple(zip(range(5, 50, 2), range(2, 22)))
 
 MIX_POLICIES = ("repo", "paper")
@@ -281,7 +281,7 @@ def direct_smooth_mask(points, height, width, expansion_step,
     repeated dilation admits a closed form. After iteration ``t`` a pixel is
     active iff its Chebyshev distance to the nearest seed ``d <= 2*t``, so the
     number of contributions is ``count = clamp(T - max(1, ceil(d/2)) + 1,
-    0, T)`` and ``acc = step * count`` (plan §2). Integer distance arithmetic
+    0, T)`` and ``acc = step * count``. Integer distance arithmetic
     keeps the count exact; only the final ``step * count`` and min-max
     normalization are floating point, matching the reference's float32
     accumulation to within ~1e-7 (repeated ``+= step`` vs a single multiply).
@@ -365,7 +365,7 @@ def build_gaussian_kernel2d(k_sz, sigma, dtype=torch.float32, device=None):
     normalized so the 2D kernel sums to ~1 (this matches cv2.getGaussianKernel
     semantics used by the released FreeSDG implementation, where the Gaussian
     prefactor cancels under normalization). float32 by default; transfer to
-    any dtype/device via the arguments (plan §4.1).
+    any dtype/device via the arguments.
     """
     if k_sz < 1:
         raise ValueError("kernel size must be >= 1")
@@ -381,7 +381,7 @@ def build_gaussian_kernel2d(k_sz, sigma, dtype=torch.float32, device=None):
 
 
 def median_padding(x_pm1, mask):
-    """FreeSDG median background padding (plan §3.2).
+    """FreeSDG median background padding.
 
     Per sample and per channel:
       1. median across ALL spatial pixels (background included),
@@ -410,7 +410,7 @@ def median_padding(x_pm1, mask):
 
 
 class HFCFilter(nn.Module):
-    """FreeSDG High-Frequency-Content filter (plan §3.3, §4).
+    """FreeSDG High-Frequency-Content filter.
 
     forward(x_pm1, mask):
         x_pad = median_padding(x_pm1, mask)
@@ -435,7 +435,7 @@ class HFCFilter(nn.Module):
         self.pad = nn.ReplicationPad2d(self.kernel_size // 2)
 
     def gaussian_blur(self, x_pad):
-        """Depthwise Gaussian blur with replication padding (plan §4.2).
+        """Depthwise Gaussian blur with replication padding.
 
         Expands the [1,1,k,k] kernel to [C,1,k,k] for groups=C convolution;
         never passes the [1,1,k,k] kernel directly to the grouped conv.
@@ -468,7 +468,7 @@ def _sample_rectangle_repo(rng, height, width, mixup_size):
 
     mixup_size > 0 (fixed square): safe positioning guard replaces the
     upstream randrange(0, 0) crash — an intentional, documented robustness
-    correction (plan §5.2).
+    correction.
 
     Returns (y0, x0, h, w).
     """
@@ -492,12 +492,12 @@ def _sample_rectangle_repo(rng, height, width, mixup_size):
 
 
 def _sample_rectangle_paper(rng, height, width):
-    """MICCAI author-response rectangle policy (plan §5.3).
+    """MICCAI author-response rectangle policy.
 
     cx, cy ~ randint[128, 384]; s ~ randint[32, 256]; s x s square centered
     at (cx, cy). Requires 512x512 input (asserted; no invented scaling rule).
     The square interpretation of the singular "size" is an explicit
-    implementation decision (plan §19.5).
+    implementation decision.
 
     Returns (y0, x0, h, w).
     """
@@ -516,17 +516,17 @@ def _sample_rectangle_paper(rng, height, width):
 
 
 class GaussianMixUp(nn.Module):
-    """FreeSDG Frequency-Mixed Augmentation core (plan §9).
+    """FreeSDG Frequency-Mixed Augmentation core.
 
     Per sample: choose filter i, choose filter j, build two HFC views, sample
     one rectangle, paste view 2's rectangle into view 1. This is per-sample by
     design — a documented adaptation of the released code's batch-level
-    behavior (plan §19.2). The median-padded source is computed once per call
+    behavior. The median-padded source is computed once per call
     and shared between both views (the padding does not depend on the filter);
     this optimization is verified against the straightforward two-view
     reference in test_freesdg_smoke.py.
 
-    Deterministic hooks (plan §9 "Deterministic hooks"): ``filter_idx_1``,
+    Deterministic hooks: ``filter_idx_1``,
     ``filter_idx_2`` and ``rectangle`` can be injected explicitly so tests
     never rely on probabilistic assertions. When any parameter must be
     sampled, a dedicated ``rng`` (never the global stream) must be provided.
@@ -574,7 +574,7 @@ class GaussianMixUp(nn.Module):
                 "filter indices or the rectangle are not injected"
             )
         # Draw order (dedicated RNG): filter i, filter j, then rectangle
-        # (plan §9; upstream drew the rectangle first — see §19.2 deviation).
+        # Upstream drew the rectangle first; this implementation draws filters first.
         if filter_idx_1 is None:
             filter_idx_1 = rng.randrange(0, len(self.filters))
         if filter_idx_2 is None:
@@ -615,7 +615,7 @@ def fmaug_seed_for_worker(base_seed, worker_info):
 
 class FreeSDGAugmentor:
     """Owns the filter bank, anchor filter, dedicated RNG, and range
-    conversions (plan §9). The only place where [0,1] <-> [-1,1] happens.
+    conversions. The only place where [0,1] <-> [-1,1] happens.
 
     ``augment_train(img01, mask01, raw_prob)``:
         dedicated-RNG raw/FMAug coin; raw branch returns img01 unchanged,
@@ -680,7 +680,7 @@ class FreeSDGAugmentor:
 
         Draw order (dedicated RNG, uniform across modes): raw/FMAug coin
         first, then the mode's own draws:
-          * fmaug:          filter i, filter j, rectangle   (plan §9)
+          * fmaug:          filter i, filter j, rectangle
           * fixed_hfc:      none (deterministic anchor filter)
           * random_hfc:     single Gaussian-bank filter index
           * raffe_filter:   per-channel bank indices (ch0, ch1, ch2)
@@ -691,7 +691,7 @@ class FreeSDGAugmentor:
         (filter_idx for random_hfc, raffe_indices_*/blend_mask/blend_points
         for the raffe modes); production code never passes them. ``blend_points``
         injects the DT2 seed coordinates so the iterative and direct mask
-         implementations can be compared on identical seeds (plan §5/§6.1).
+        implementations can be compared on identical seeds.
         With ``return_branch=True``, result includes branch ``'raw'`` or
         ``'augmented'``.
         """
@@ -743,7 +743,7 @@ class FreeSDGAugmentor:
             return _result(output, 'augmented')
 
     def anchor(self, img01, mask01):
-        """Fixed-anchor HFC preprocessing for evaluation (plan §1.6/§7)."""
+        """Fixed-anchor HFC preprocessing for evaluation."""
         with torch.no_grad():
             x, m, squeeze = self._as_batch(img01, mask01)
             x_pm1 = 2.0 * x - 1.0
@@ -756,7 +756,7 @@ class FreeSDGAugmentor:
         """Convert a [C,H,W] [0,1] float tensor to a uint8 PIL image.
 
         Train-path only; introduces ~1/255 quantization because LwNet's paired
-        transforms are PIL-based (plan §8/§19.6). Never used on evaluation
+        transforms are PIL-based. Never used on evaluation
         anchor paths, which stay float.
         """
         from PIL import Image
