@@ -1,0 +1,13 @@
+# Python 3.10 is recommended. Install torch and torchvision as a compatible
+# pair from https://pytorch.org/get-started/locally/ for CPU or CUDA.
+torch==2.13.0
+torchvision==0.28.0
+numpy>=1.23
+pandas>=1.5
+Pillow>=9.0
+scikit-image>=0.19
+scikit-learn>=1.1
+scipy>=1.8
+matplotlib>=3.5
+tqdm>=4.64
+packaging>=21

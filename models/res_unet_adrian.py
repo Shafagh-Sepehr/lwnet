@@ -119,16 +119,87 @@ class UNet(nn.Module):
 
         self.final = nn.Conv2d(layers[0], n_classes, kernel_size=1)
 
-    def forward(self, x):
+    def encode(self, x):
         x = self.first(x)
         down_activations = []
-        for i, down in enumerate(self.down_path):
+        for down in self.down_path:
             down_activations.append(x)
             x = down(x)
         down_activations.reverse()
+        return x, tuple(down_activations)
+
+    def decode(self, x, down_activations, return_decoder_features=False, decoder_additions=None):
+        if decoder_additions is not None and len(decoder_additions) != len(self.up_path):
+            raise ValueError('decoder_additions must match the number of decoder stages')
+
+        decoder_features = []
         for i, up in enumerate(self.up_path):
             x = up(x, down_activations[i])
-        return self.final(x)
+
+            if decoder_additions is not None:
+                addition = decoder_additions[i]
+                if addition is not None:
+                    if addition.shape != x.shape:
+                        raise RuntimeError(
+                            'cross-stage bridge shape mismatch at decoder stage {}: {} vs {}'.format(
+                                i, tuple(addition.shape), tuple(x.shape)))
+                    x = x + addition       # not in-place
+
+            decoder_features.append(x)
+
+        logits = self.final(x)
+        if return_decoder_features:
+            return logits, tuple(decoder_features)
+        return logits
+
+    def forward(self, x, return_decoder_features=False, decoder_additions=None):
+        x, skips = self.encode(x)
+        return self.decode(
+            x,
+            skips,
+            return_decoder_features=return_decoder_features,
+            decoder_additions=decoder_additions,
+        )
+
+
+class AuxiliarySaliencyDecoder(nn.Module):
+    """Auxiliary decoder that reconstructs a 3-channel structural-saliency map.
+
+    Branches from a U-Net encoder's bottleneck and skip features and mirrors
+    the existing U-Net decoder topology. It accepts no
+    cross-stage additions and uses no features from any segmentation decoder.
+    Its output is ``tanh``-bounded to ``[-1, +1]`` to match the structural
+    target.
+    """
+
+    def __init__(self, layers, output_channels=3, k_sz=3, up_mode='transp_conv',
+                 conv_bridge=True, shortcut=True):
+        super(AuxiliarySaliencyDecoder, self).__init__()
+        self.up_path = nn.ModuleList()
+        reversed_layers = list(reversed(layers))
+        for i in range(len(layers) - 1):
+            block = UpConvBlock(in_c=reversed_layers[i], out_c=reversed_layers[i + 1],
+                                k_sz=k_sz, up_mode=up_mode, conv_bridge=conv_bridge,
+                                shortcut=shortcut)
+            self.up_path.append(block)
+
+        self.final = nn.Conv2d(layers[0], output_channels, kernel_size=1)
+
+        # init, shamelessly lifted from torchvision/models/resnet.py
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, bottleneck, encoder_skips):
+        x = bottleneck
+        for i, up in enumerate(self.up_path):
+            x = up(x, encoder_skips[i])
+        x = self.final(x)
+        return torch.tanh(x)
+
 
 class WNet(nn.Module):
     def __init__(self, in_c, n_classes, layers, k_sz=3, up_mode='transp_conv', conv_bridge=True, shortcut=True):
@@ -212,4 +283,3 @@ class WNet(nn.Module):
         out2 = self.final_2(x)
 
         return out1, out2
-

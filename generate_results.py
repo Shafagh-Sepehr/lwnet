@@ -12,7 +12,7 @@ from skimage.util import img_as_ubyte
 from skimage.transform import resize
 import torch
 from utils.model_saving_loading import str2bool
-from models.get_model import get_arch
+from models.get_model import get_arch_from_config
 from utils.get_loaders import get_test_dataset
 from utils.model_saving_loading import load_model
 
@@ -30,6 +30,9 @@ parser.add_argument('--im_size', help='delimited list input, could be 600,400', 
 parser.add_argument('--device', type=str, default='cpu', help='where to run the training code (e.g. "cpu" or "cuda:0") [default: %(default)s]')
 parser.add_argument('--in_c', type=int, default=3, help='channels in input images')
 parser.add_argument('--result_path', type=str, default='results', help='path to save predictions (defaults to results')
+# FreeSDG FMAug eval-input override: None means "use the training
+# config value, falling back to raw"; explicit values override the config.
+parser.add_argument('--freesdg_test_input', type=str, default=None, choices=['raw', 'anchor'], help='override FreeSDG eval input policy (raw/anchor); default: training-config value or raw')
 
 def flip_ud(tens):
     return torch.flip(tens, dims=[1])
@@ -40,9 +43,14 @@ def flip_lr(tens):
 def flip_lrud(tens):
     return torch.flip(tens, dims=[1, 2])
 
-def create_pred(model, tens, mask, coords_crop, original_sz, tta='no'):
+def create_pred(model, tens, mask, coords_crop, original_sz, tta='no', device=None):
     act = torch.sigmoid if model.n_classes == 1 else torch.nn.Softmax(dim=0)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # NOTE (unrelated upstream bug fix, kept separate from FreeSDG logic):
+    # create_pred previously always picked cuda-if-available, ignoring the
+    # CLI-selected --device; it now receives the caller's device and only
+    # falls back to the old behavior when not passed.
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     with torch.no_grad():
         logits = model(tens.unsqueeze(dim=0).to(device)).squeeze(dim=0)
     pred = act(logits)
@@ -72,9 +80,13 @@ def create_pred(model, tens, mask, coords_crop, original_sz, tta='no'):
     return full_pred
 
 def save_pred(full_pred, save_results_path, im_name):
-    os.makedirs(save_results_path, exist_ok=True)
     im_name = im_name.rsplit('/', 1)[-1]
     save_name = osp.join(save_results_path, im_name[:-4] + '.png')
+    # NOTE (unrelated upstream bug fix, kept separate from FreeSDG logic):
+    # Windows-generated CSVs mix '/' and '\' in paths, so im_name may still
+    # contain a directory component; create the actual target directory
+    # instead of assuming save_results_path is the final directory.
+    os.makedirs(osp.dirname(save_name), exist_ok=True)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -88,6 +100,8 @@ if __name__ == '__main__':
     '''
 
     args = parser.parse_args()
+    # Capture the CLI override before the config file overwrites the namespace.
+    cli_freesdg_test_input = args.freesdg_test_input
 
     if args.device.startswith("cuda"):
         # In case one has multiple devices, we must first set the one
@@ -115,6 +129,22 @@ if __name__ == '__main__':
     model_name = args.model_name
     in_c = args.in_c
 
+    # FreeSDG eval-input resolution: CLI value -> training-config
+    # value -> raw. Anchor preprocessing applies only when the training config
+    # indicates FreeSDG AND the resolved policy is 'anchor'.
+    cfg_freesdg = bool(args.__dict__.get('freesdg', False))
+    if cli_freesdg_test_input is not None:
+        freesdg_test_input = cli_freesdg_test_input
+    elif args.__dict__.get('freesdg_test_input') is not None:
+        freesdg_test_input = args.freesdg_test_input
+    else:
+        freesdg_test_input = 'raw'
+    use_freesdg_anchor = cfg_freesdg and freesdg_test_input == 'anchor'
+    if freesdg_test_input == 'anchor' and not cfg_freesdg:
+        print("* WARNING: --freesdg_test_input anchor requested, but the training "
+              "config has no active FreeSDG fields (freesdg=false or absent); "
+              "anchor preprocessing is skipped and raw input is used.")
+
     if experiment_path is None: raise Exception('must specify path to experiment')
 
     im_size = tuple([int(item) for item in args.im_size.split(',')])
@@ -132,8 +162,7 @@ if __name__ == '__main__':
     print('* Reading test data from ' + osp.join(data_path, csv_path))
     test_dataset = get_test_dataset(data_path, csv_path=csv_path, tg_size=tg_size)
     print('* Instantiating model  = ' + str(model_name))
-    model = get_arch(model_name, in_c=in_c).to(device)
-    if model_name == 'wnet': model.mode='eval'
+    model = get_arch_from_config(args, in_c=in_c, device=device)
 
     print('* Loading trained weights from ' + experiment_path)
     try:
@@ -144,11 +173,42 @@ if __name__ == '__main__':
 
     save_results_path = osp.join(args.result_path, dataset, experiment_path)
     print('* Saving predictions to ' + save_results_path)
+
+    # FreeSDG fixed-anchor inference preprocessing is float-only,
+    # no uint8 round-trip; applied once per image before the existing flip
+    # TTA, which is valid because the Gaussian kernel and mask operations are
+    # reflection-equivariant under the existing TTA flips.
+    if use_freesdg_anchor:
+        from utils.freesdg_aug import FreeSDGAugmentor
+        from torchvision.transforms import functional as tvF
+        from torchvision.transforms import InterpolationMode
+        from PIL import Image
+        print('* Using FreeSDG anchor eval input (w={}, sigma={}, ratio={})'.format(
+            args.__dict__.get('freesdg_anchor_w', 27),
+            args.__dict__.get('freesdg_anchor_sigma', 9),
+            args.__dict__.get('freesdg_ratio', 4.0)))
+        anchoror = FreeSDGAugmentor(
+            ratio=args.__dict__.get('freesdg_ratio', 4.0),
+            anchor_w=args.__dict__.get('freesdg_anchor_w', 27),
+            anchor_sigma=args.__dict__.get('freesdg_anchor_sigma', 9))
+
+        def align_fov_mask(mask, coords_crop, hw):
+            # FOV flow (§15): original mask -> same bbox crop as the image ->
+            # NEAREST resize -> binary {0,1} tensor
+            minr, minc, maxr, maxc = coords_crop
+            mask_crop = mask[minr:maxr, minc:maxc]
+            mask_pil = Image.fromarray((mask_crop.astype(np.uint8)) * 255, mode='L')
+            mask_rsz = tvF.resize(mask_pil, hw, InterpolationMode.NEAREST)
+            return tvF.to_tensor(mask_rsz)
+
     times = []
     for i in tqdm(range(len(test_dataset))):
         im_tens, mask, coords_crop, original_sz, im_name = test_dataset[i]
+        if use_freesdg_anchor:
+            mask01 = align_fov_mask(mask, coords_crop, tuple(im_tens.shape[-2:]))
+            im_tens = anchoror.anchor(im_tens, mask01)
         start_time = time.perf_counter()
-        full_pred = create_pred(model, im_tens, mask, coords_crop, original_sz, tta=tta)
+        full_pred = create_pred(model, im_tens, mask, coords_crop, original_sz, tta=tta, device=device)
         times.append(time.perf_counter() - start_time)
         save_pred(full_pred, save_results_path, im_name)
 

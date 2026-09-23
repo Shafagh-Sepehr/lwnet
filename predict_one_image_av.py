@@ -11,7 +11,7 @@ from skimage.io import imsave
 from skimage.util import img_as_ubyte
 from skimage.transform import resize
 import torch
-from models.get_model import get_arch
+from models.get_model import get_arch_from_config
 from utils.model_saving_loading import load_model
 from skimage.measure import regionprops
 
@@ -105,9 +105,10 @@ def flip_lrud(tens):
     return torch.flip(tens, dims=[1, 2])
 
 
-def create_pred(model, tens, mask, coords_crop, original_sz, tta='no'):
+def create_pred(model, tens, mask, coords_crop, original_sz, tta='no', device=None):
     act = torch.nn.Softmax(dim=0)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device is None:
+        device = next(model.parameters()).device
     with torch.no_grad():
         logits = model(tens.unsqueeze(dim=0).to(device)).squeeze(dim=0)
     prob = act(logits)
@@ -179,7 +180,17 @@ if __name__ == '__main__':
 
     tta = args.tta
 
-    model_name = 'big_wnet'
+    # Recover architecture (model_name + bridge options) from the model
+    # directory's config.cfg; fall back to the legacy big_wnet/n_classes=4
+    # defaults when no config exists.
+    import json
+    model_cfg = {}
+    config_file = osp.join(args.model_path, 'config.cfg')
+    if osp.isfile(config_file):
+        with open(config_file, 'r') as f:
+            model_cfg = json.load(f)
+
+    model_name = model_cfg.get('model_name', 'big_wnet')
     model_path = args.model_path
     im_path = args.im_path
     im_loc = osp.dirname(im_path)
@@ -222,8 +233,7 @@ if __name__ == '__main__':
     im_tens = tr(img)  # only transform image
 
     print('* Instantiating model  = ' + str(model_name))
-    model = get_arch(model_name, n_classes=4).to(device)
-    if model_name == 'big_wnet': model.mode='eval'
+    model = get_arch_from_config(model_cfg, n_classes=4, device=device)
 
     print('* Loading trained weights from ' + model_path)
     model, stats = load_model(model, model_path, device)
@@ -231,7 +241,9 @@ if __name__ == '__main__':
 
     print('* Saving prediction to ' + im_path_out)
     start_time = time.perf_counter()
-    full_pred, full_pred_bin = create_pred(model, im_tens, mask, coords_crop, original_sz, tta=tta)
+    full_pred, full_pred_bin = create_pred(
+        model, im_tens, mask, coords_crop, original_sz,
+        tta=tta, device=device)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         imsave(im_path_out, img_as_ubyte(full_pred))

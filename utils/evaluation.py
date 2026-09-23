@@ -4,16 +4,16 @@ import numpy as np
 from scipy.stats import rankdata
 
 def dice_score(actual, predicted):
-    actual = np.asarray(actual).astype(np.bool)
-    predicted = np.asarray(predicted).astype(np.bool)
+    actual = np.asarray(actual).astype(bool)
+    predicted = np.asarray(predicted).astype(bool)
     im_sum = actual.sum() + predicted.sum()
     if im_sum == 0: return 1
     intersection = np.logical_and(actual, predicted)
     return 2. * intersection.sum() / im_sum
 
 def accuracy_score(actual, predicted):
-    actual = np.asarray(actual).astype(np.bool)
-    predicted = np.asarray(predicted).astype(np.bool)
+    actual = np.asarray(actual).astype(bool)
+    predicted = np.asarray(predicted).astype(bool)
     num_els = actual.size
     intersection = np.logical_and(actual, predicted)
     return float(intersection.sum()) / num_els

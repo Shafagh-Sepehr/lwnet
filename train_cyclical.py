@@ -1,4 +1,4 @@
-import sys, json, os, argparse, math, time
+import sys, json, os, argparse, copy, random, shutil
 from shutil import copyfile, rmtree
 import os.path as osp
 from datetime import datetime
@@ -6,17 +6,25 @@ import operator
 from tqdm import tqdm
 import numpy as np
 import torch
-from models.get_model import get_arch
+import torch.nn.functional as F
+from models.get_model import (
+    get_arch, get_arch_options, validate_cross_stage_bridge,
+    validate_structural_saliency, validate_u2_arch,
+)
 
 from utils.get_loaders import get_train_val_loaders
 from utils.evaluation import evaluate, ewma
 from utils.model_saving_loading import save_model, str2bool, load_model
-from utils.reproducibility import set_seeds, get_rng_states, set_rng_states
+from utils.reproducibility import set_seeds
+from utils.checkpoint_selection import parse_metric_policy, compare_checkpoint
+from utils.structural_saliency import StructuralSaliencyTarget
+
+from segmentation_losses import build_segmentation_loss
 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from utils.schedulers import (DampedCosineLRSchedule, DampedCosineError,
-                              validate_damped_cosine_config,
-                              damped_cosine_schedule_max)
+                               validate_damped_cosine_config,
+                               damped_cosine_schedule_max)
 
 # argument parsing
 parser = argparse.ArgumentParser()
@@ -26,45 +34,124 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument('--csv_train', type=str, default='data/DRIVE/train.csv', help='path to training data csv')
 parser.add_argument('--model_name', type=str, default='wnet', help='architecture')
+parser.add_argument('--u2_arch', choices=['unet', 'fr_multi'], default='unet',
+                    help='second-stage architecture: original Little U-Net or full-resolution multi-resolution U2')
+parser.add_argument('--fr_u2_base_channels', type=int, default=8,
+                    help='base channel width of FR-U2')
+parser.add_argument('--fr_u2_dilations', type=str, default='1,2,4,2,1',
+                    help='ordered dilation schedule for FR-U2 multi-resolution interaction stages')
+parser.add_argument('--fr_lite', action='store_true',
+                    help='use the lightweight full-resolution multi-resolution U2; implies --u2_arch fr_multi')
 parser.add_argument('--batch_size', type=int, default=4, help='batch Size')
 parser.add_argument('--grad_acc_steps', type=int, default=0, help='gradient accumulation steps (0)')
 parser.add_argument('--min_lr', type=float, default=1e-8, help='learning rate')
 parser.add_argument('--max_lr', type=float, default=0.01, help='learning rate')
 parser.add_argument('--cycle_lens', type=str, default='20/50', help='cycling config (nr cycles/cycle len')
 parser.add_argument('--metric', type=str, default='auc', help='which metric to use for monitoring progress (tr_auc/auc/loss/dice)')
+parser.add_argument('--epoch_checkpointing_from', type=int, default=0,
+                    help='start epoch-level checkpointing at this 1-based cycle; 0 keeps cycle-level checkpointing')
+parser.add_argument('--metric_tolerances', type=str, default=None, help='optional comma-separated metric=value absolute tolerances')
 parser.add_argument('--im_size', help='delimited list input, could be 600,400', type=str, default='512')
 parser.add_argument('--in_c', type=int, default=3, help='channels in input images')
 parser.add_argument('--do_not_save', type=str2bool, nargs='?', const=True, default=False, help='avoid saving anything')
 parser.add_argument('--save_path', type=str, default='date_time', help='path to save model (defaults to date/time')
 # these three are for training with pseudo-segmentations
 # e.g. --csv_test data/DRIVE/test.csv --path_test_preds results/DRIVE/experiments/wnet_drive
-# e.g. --csv_test data/LES_AV/test_all.csv --path_test_preds results/DRIVE/experiments/wnet_drive
+# e.g. --csv_test data/LES_AV/test_all.csv --path_test_preds results/LES_AV/experiments/wnet_drive
 parser.add_argument('--csv_test', type=str, default=None, help='path to test data csv (for using pseudo labels)')
 parser.add_argument('--path_test_preds', type=str, default=None, help='path to test predictions (for using pseudo labels)')
 parser.add_argument('--checkpoint_folder', type=str, default=None, help='path to model to start training (with pseudo labels now)')
 parser.add_argument('--num_workers', type=int, default=0, help='number of parallel (multiprocessing) workers to launch for data loading tasks (handled by pytorch) [default: %(default)s]')
 parser.add_argument('--device', type=str, default='cpu', help='where to run the training code (e.g. "cpu" or "cuda:0") [default: %(default)s]')
 parser.add_argument('--seed', type=int, default=0, help='seed')
-# learning-rate schedule selection
 parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'damped_cosine'],
-                    help="learning-rate schedule: 'cosine' (original CosineAnnealingLR behavior, default) "
-                         "or 'damped_cosine' (decaying full-cosine oscillation)")
+                    help="learning-rate schedule: original cosine or damped full-cosine")
 parser.add_argument('--dc_alpha', type=float, default=3.0,
-                    help='damped_cosine: envelope decay strength; must be > -1 '
-                         '(negative values in (-1, 0) inflate the lr peaks above max_lr over training)')
-parser.add_argument('--dc_inflate_max_lr', type=float, default=0.1,
-                    help='damped_cosine: hard cap on the lr for inflation mode (alpha < 0); '
-                         'the growing envelope is clamped so lr never exceeds this. '
-                         'Must be > max_lr. No effect for alpha >= 0 [default: %(default)s]')
-parser.add_argument('--dc_show_max_lr', action='store_true',
-                    help='query mode: print the highest lr the run will ever hit with these settings '
-                         '(and at which cycle/epoch/update), then exit without training')
-parser.add_argument('--dc_d', type=float, default=0.95, help='damped_cosine: oscillation depth in [0, 1]')
+                    help='damped cosine envelope decay; values in (-1, 0) inflate peaks')
+parser.add_argument('--dc_d', type=float, default=0.95,
+                    help='damped cosine oscillation depth in [0, 1]')
 parser.add_argument('--dc_period', type=int, default=0,
-                    help='damped_cosine: oscillation period in optimizer updates '
-                         '(0 = automatic: 2 x cycle_len x updates/epoch, matching the original scheduler oscillation)')
+                    help='damped cosine period in optimizer updates; 0 selects the default')
+parser.add_argument('--dc_inflate_max_lr', type=float, default=0.1,
+                    help='damped cosine inflation cap; must exceed max_lr when used')
+parser.add_argument('--dc_show_max_lr', action='store_true',
+                    help='print the exact discrete damped-cosine peak and exit')
 parser.add_argument('--resume_from', type=str, default=None,
-                    help='path to a previous experiment folder whose training_state.pth should be resumed')
+                    help='resume from a cycle-boundary training_state.pth')
+# FreeSDG-style Frequency-Mixed Augmentation (FMAug); see utils/freesdg_aug.py
+parser.add_argument('--freesdg', action='store_true', help='enable FreeSDG FMAug training-time augmentation (dataset-side)')
+parser.add_argument('--freesdg_raw_prob', type=float, default=0.0, help='probability of feeding the raw image instead of the FMAug view during training')
+parser.add_argument('--freesdg_test_input', type=str, default='raw', choices=['raw', 'anchor'], help='validation/inference input policy')
+parser.add_argument('--freesdg_anchor_w', type=int, default=27, help='anchor HFC Gaussian kernel width')
+parser.add_argument('--freesdg_anchor_sigma', type=float, default=9, help='anchor HFC Gaussian sigma')
+parser.add_argument('--freesdg_ratio', type=float, default=4.0, help='HFC residual amplification ratio (bank and anchor)')
+parser.add_argument('--freesdg_mixup_size', type=int, default=-1, help='FMAug rectangle size: -1 random (repo policy) or >0 fixed square; 0 is invalid')
+parser.add_argument('--freesdg_mix_policy', type=str, default='repo', choices=['repo', 'paper'], help='FMAug rectangle sampling policy')
+parser.add_argument('--freesdg_seed', type=int, default=0, help='dedicated seed for the isolated FMAug RNG stream')
+# Diagnostic-stage selectors (defaults preserve existing behavior)
+parser.add_argument('--freesdg_aug_mode', type=str, default='fmaug', choices=['fmaug', 'fixed_hfc', 'random_hfc', 'raffe_filter', 'raffe_smooth_mix'], help='training augmentation mode: full FreeSDG FMAug, deterministic fixed anchor HFC, single random bank HFC view, official RaffeSDG random frequency filtering, or RaffeSDG smooth blending')
+parser.add_argument('--freesdg_lwnet_aug_profile', type=str, default='original', choices=['original', 'flips_only'], help='LwNet augmentation applied after the frequency transform: original pipeline or flips only (diagnostic)')
+parser.add_argument(
+    '--freesdg_disable_aug_color_jitter', action='store_true',
+    help=('disable post-frequency ColorJitter only for non-raw '
+          'FreeSDG/RAFFE training samples; raw samples retain the full '
+          'original LwNet augmentation pipeline'))
+# Optional RaffeSDG-derived structural-saliency self-supervision.
+parser.add_argument('--structural_saliency', action='store_true', help='enable RaffeSDG-derived structural-saliency self-supervision')
+parser.add_argument('--structural_saliency_weight', type=float, default=1.0, help='weight of the structural-saliency reconstruction MSE')
+parser.add_argument('--structural_saliency_kernel', type=int, default=27, help='Gaussian kernel width used to construct the structural-saliency target')
+parser.add_argument('--structural_saliency_sigma', type=float, default=9.0, help='Gaussian sigma used to construct the structural-saliency target')
+parser.add_argument('--structural_saliency_ratio', type=float, default=4.0, help='amplification factor applied to the Gaussian high-frequency residual')
+# Composable segmentation losses (independent of FreeSDG/augmentation):
+# total = w_bce*bce + w_dice*dice + w_cldice*cldice + w_boundary*boundary
+parser.add_argument('--loss_bce_weight', type=float, default=1.0, help='weight of the BCE term (the existing baseline term)')
+parser.add_argument('--loss_dice_weight', type=float, default=0.0, help='weight of the foreground soft Dice term')
+parser.add_argument('--loss_cldice_weight', type=float, default=0.0, help='weight of the foreground soft-clDice topology term')
+parser.add_argument('--loss_boundary_weight', type=float, default=0.0, help='weight of the signed-distance boundary term (distances in pixels: resolution/scale dependent, pilot at 0.01)')
+parser.add_argument('--loss_cldice_iters', type=int, default=10, help='soft-skeleton erosion iterations for the clDice term')
+
+
+def validate_freesdg_args(args):
+    if args.freesdg_disable_aug_color_jitter and not args.freesdg:
+        parser.error('--freesdg_disable_aug_color_jitter requires --freesdg')
+    if (args.freesdg_disable_aug_color_jitter
+            and args.freesdg_lwnet_aug_profile == 'flips_only'):
+        parser.error('--freesdg_disable_aug_color_jitter cannot combine with '
+                     '--freesdg_lwnet_aug_profile flips_only')
+
+
+def write_training_config(args, config_file_path):
+    with open(config_file_path, 'w') as f:
+        json.dump(vars(args), f, indent=2)
+
+
+def format_fr_u2_dilations(dilations):
+    return '[{}]'.format(','.join(str(d) for d in dilations))
+
+
+def resolve_arch_args(args):
+    """Canonicalize architecture flags before config serialization."""
+    if args.fr_lite:
+        args.u2_arch = 'fr_multi'
+
+    args.u2_arch, args.fr_u2_base_channels, args.fr_u2_dilations = validate_u2_arch(
+        args.u2_arch,
+        args.fr_u2_base_channels,
+        args.fr_u2_dilations,
+        args.model_name,
+        args.cross_stage_bridge,
+        fr_lite=args.fr_lite,
+    )
+    return args
+
+
+# Zero-initialized gated cross-stage decoder bridges (A1)
+parser.add_argument('--cross_stage_bridge', choices=['none', 'scalar', 'channel'], default='none',
+                    help='U1-decoder to U2-decoder gated residual bridge type')
+parser.add_argument('--cross_stage_bridge_scales', type=str, default='all',
+                    help='all or a comma-separated subset of quarter,half,full')
+parser.add_argument('--cross_stage_bridge_init', type=float, default=0.0,
+                    help='initial raw bridge gate value; A1 default is exactly 0.0')
 
 
 def compare_op(metric):
@@ -96,11 +183,70 @@ def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
 
-def is_damped(scheduler):
-    return getattr(scheduler, 'kind', 'cosine') == 'damped_cosine'
+def _rng_state():
+    return {
+        'python': random.getstate(), 'numpy': np.random.get_state(),
+        'torch_cpu': torch.get_rng_state(),
+        'torch_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+def _restore_rng_state(state):
+    random.setstate(state['python']); np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch_cpu'])
+    if state.get('torch_cuda') is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state['torch_cuda'])
+
+def save_training_state(path, model, optimizer, scheduler, next_cycle,
+                        completed_epochs, incumbent, selection_stats,
+                        max_validation_auc_seen, metric_policy, cycle_lens):
+    state = {'schema_version': 1, 'model_state_dict': model.state_dict(),
+             'optimizer_state_dict': optimizer.state_dict(),
+             'scheduler_state_dict': scheduler.state_dict(),
+             'scheduler_type': getattr(scheduler, 'kind', 'cosine'),
+             'next_cycle': next_cycle, 'completed_epochs': completed_epochs,
+             'incumbent': incumbent, 'selection_stats': selection_stats,
+             'max_validation_auc_seen': max_validation_auc_seen,
+             'metric_policy': metric_policy, 'cycle_lens': list(cycle_lens),
+             'rng_states': _rng_state()}
+    target = osp.join(path, 'training_state.pth')
+    temporary = target + '.tmp'
+    torch.save(state, temporary)
+    os.replace(temporary, target)
+
+def format_loss_components(split, comps, criterion, extra_weights=None):
+    # One line of unweighted values, CLI weights, and weighted contributions;
+    # disabled terms are simply absent from comps.
+    weights = dict(getattr(criterion, 'weights', {}))
+    if extra_weights:
+        weights.update(extra_weights)
+    parts = []
+    for name, value in comps.items():
+        w = weights.get(name)
+        if w is None:
+            parts.append('{:s}={:.4f}'.format(name, value))
+        else:
+            parts.append('{:s}={:.4f} (w={:g} -> {:.4f})'.format(name, value, w, w * value))
+    return '{} loss components: {}'.format(split, ' | '.join(parts))
+
+
+def format_metric_transition(previous, candidate):
+    """Format two metrics precisely enough to show where they diverge."""
+    previous_text = '{:.16f}'.format(float(previous))
+    candidate_text = '{:.16f}'.format(float(candidate))
+    previous_decimals = previous_text.split('.')[1]
+    candidate_decimals = candidate_text.split('.')[1]
+    shared = 0
+    for left, right in zip(previous_decimals, candidate_decimals):
+        if left != right:
+            break
+        shared += 1
+    precision = min(shared + 2, 16)
+    template = '{:.' + str(precision) + 'f}'
+    return template.format(float(previous)), template.format(float(candidate))
 
 def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
-        grad_acc_steps=0, assess=False, lr_log=None):
+        grad_acc_steps=0, assess=False, structural_target_builder=None,
+        structural_saliency_weight=0.0):
     device='cuda' if next(model.parameters()).is_cuda else 'cpu'
     train = optimizer is not None  # if we are in training mode there will be an optimizer and train=True here
 
@@ -113,24 +259,78 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
 
     if assess: logits_all, labels_all = [], []
     n_elems, running_loss, tr_lr = 0, 0, 0
+    # Detached component sums kept as device tensors; they are transferred to
+    # Python floats once per epoch (no per-batch GPU synchronization).
+    comp_running = {}
 
+    for i_batch, batch in enumerate(loader):
+        inputs = batch[0]
+        labels = batch[1]
+        offset = 2
+        distance_maps = None
+        structural_reference = None
+        structural_mask = None
+        if getattr(criterion, 'need_distance_map', False):
+            distance_maps = batch[offset]
+            offset += 1
+        if train and structural_target_builder is not None:
+            structural_reference = batch[offset]
+            structural_mask = batch[offset + 1]
+            offset += 2
+        if offset != len(batch):
+            raise RuntimeError('unexpected batch length {} (expected {})'.format(len(batch), offset))
 
-    for i_batch, (inputs, labels) in enumerate(loader):
-        inputs, labels = inputs.to(device), labels.to(device)
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        if distance_maps is not None:
+            distance_maps = distance_maps.to(device)
+        if structural_reference is not None:
+            structural_reference = structural_reference.to(device)
+            structural_mask = structural_mask.to(device)
+
         logits = model(inputs)
+        components = None
+        saliency_prediction = None
         if isinstance(logits, tuple): # wnet
-            logits_aux, logits = logits
-            if model.n_classes == 1: # BCEWithLogitsLoss()/DiceLoss()
-                loss_aux = criterion(logits_aux, labels.unsqueeze(dim=1).float())
-                loss = loss_aux + criterion(logits, labels.unsqueeze(dim=1).float())
+            if train and structural_target_builder is not None:
+                if len(logits) != 3:
+                    raise RuntimeError('structural saliency training expected a 3-tuple (x1, x2, saliency), got length {}'.format(len(logits)))
+                logits_aux, logits, saliency_prediction = logits
+            else:
+                logits_aux, logits = logits
+            if model.n_classes == 1: # SegmentationLoss (same criterion on each head)
+                tgt = labels.unsqueeze(dim=1).float()
+                loss_aux, comps_aux = criterion(logits_aux, tgt, distance_map=distance_maps)
+                loss, comps_main = criterion(logits, tgt, distance_map=distance_maps)
+                loss = loss_aux + loss
+                # aggregate reported components with the same (unit) head weights
+                # so their weighted sum matches the total
+                components = {k: comps_aux[k] + comps_main[k] for k in comps_main}
             else: # CrossEntropyLoss()
                 loss_aux = criterion(logits_aux, labels)
                 loss = loss_aux + criterion(logits, labels)
         else: # not wnet
             if model.n_classes == 1:
-                loss = criterion(logits, labels.unsqueeze(dim=1).float())  # BCEWithLogitsLoss()/DiceLoss()
+                loss, components = criterion(logits, labels.unsqueeze(dim=1).float(), distance_map=distance_maps)  # SegmentationLoss
             else:
                 loss = criterion(logits, labels)  # CrossEntropyLoss()
+
+        if saliency_prediction is not None:
+            with torch.no_grad():
+                saliency_target = structural_target_builder(
+                    structural_reference, structural_mask)
+            if saliency_prediction.shape != saliency_target.shape:
+                raise RuntimeError('saliency prediction shape {} != target shape {}'.format(
+                    tuple(saliency_prediction.shape), tuple(saliency_target.shape)))
+            if not torch.isfinite(saliency_prediction).all():
+                raise RuntimeError('nonfinite saliency prediction')
+            if not torch.isfinite(saliency_target).all():
+                raise RuntimeError('nonfinite saliency target')
+            saliency_loss = F.mse_loss(saliency_prediction, saliency_target, reduction='mean')
+            loss = loss + structural_saliency_weight * saliency_loss
+            if components is None:
+                components = {}
+            components['structural_saliency'] = saliency_loss.detach()
 
         # if train:  # only in training mode
         #     optimizer.zero_grad()
@@ -142,169 +342,183 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
             (loss / (grad_acc_steps + 1)).backward() # for grad_acc_steps=0, this is just loss
             tr_lr = get_lr(optimizer)
             if i_batch % (grad_acc_steps+1) == 0:  # for grad_acc_steps=0, this is always True
-                if lr_log is not None:
-                    lr_log.append(float(tr_lr))  # lr actually used by this optimizer update
                 optimizer.step()
-                if is_damped(scheduler):
-                    scheduler.step()  # exactly one scheduler step per optimizer update
+                if getattr(scheduler, 'kind', 'cosine') == 'damped_cosine':
+                    scheduler.step()
                 else:
-                    # original behavior, preserved for the default scheduler
                     for _ in range(grad_acc_steps+1):
-                        scheduler.step() # for grad_acc_steps=0, this means once
+                        scheduler.step() # preserve the original cosine cadence
                 optimizer.zero_grad()
         if assess:
-            logits_all.extend(logits)
-            labels_all.extend(labels)
+            logits_all.extend(logits.detach())
+            labels_all.extend(labels.detach())
 
         # Compute running loss
         running_loss += loss.item() * inputs.size(0)
         n_elems += inputs.size(0)
         run_loss = running_loss / n_elems
+        if components is not None:
+            for k, v in components.items():
+                comp_running[k] = comp_running.get(k, 0.0) + v * inputs.size(0)
 
-    if assess: return logits_all, labels_all, run_loss, tr_lr
-    return None, None, run_loss, tr_lr
+    comp_means = None
+    if comp_running:
+        comp_means = {k: (v / n_elems).item() for k, v in comp_running.items()}
 
-def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0, cycle=0,
-                    lr_log=None, epoch_log=None, first_epoch=0):
+    if assess: return logits_all, labels_all, run_loss, tr_lr, comp_means
+    return None, None, run_loss, tr_lr, comp_means
+
+def train_one_cycle(train_loader, model, criterion, optimizer=None, scheduler=None, grad_acc_steps=0,
+                    cycle=0, epoch_checkpointing_from=0, epoch_callback=None,
+                    structural_target_builder=None, structural_saliency_weight=0.0):
 
     model.train()
     optimizer.zero_grad()
     cycle_len = scheduler.cycle_lens[cycle]
 
+    deferred_assessment = None
+
     with tqdm(range(cycle_len)) as t:
         for epoch in t:
-            if epoch == cycle_len-1: assess=True # only get logits/labels on last cycle
-            else: assess = False
-            tr_logits, tr_labels, tr_loss, tr_lr = run_one_epoch(train_loader, model, criterion, optimizer=optimizer,
+            is_cycle_end = epoch == cycle_len - 1
+            epoch_mode = epoch_checkpointing_from > 0 and cycle + 1 >= epoch_checkpointing_from
+            assess = epoch_mode or is_cycle_end
+            tr_logits, tr_labels, tr_loss, tr_lr, tr_comps = run_one_epoch(train_loader, model, criterion, optimizer=optimizer,
                                                           scheduler=scheduler, grad_acc_steps=grad_acc_steps, assess=assess,
-                                                          lr_log=lr_log)
+                                                          structural_target_builder=structural_target_builder,
+                                                          structural_saliency_weight=structural_saliency_weight)
             t.set_postfix(tr_loss_lr="{:.4f}/{:.6f}".format(float(tr_loss), tr_lr))
-            if epoch_log is not None:
-                epoch_log.append({'cycle': cycle+1, 'epoch_in_cycle': epoch,
-                                  'global_epoch': first_epoch + epoch + 1,
-                                  'train_loss': float(tr_loss), 'lr': float(tr_lr)})
+            if assess and epoch_callback is not None:
+                assessment = (tr_logits, tr_labels, tr_loss, tr_comps, cycle + 1, epoch + 1, is_cycle_end)
+                if not epoch_mode:
+                    deferred_assessment = assessment
+                else:
+                    epoch_callback(*assessment, t.write)
 
-    return tr_logits, tr_labels, tr_loss
+    if deferred_assessment is not None and epoch_callback is not None:
+        epoch_callback(*deferred_assessment, print)
 
-def save_training_state(path, model, optimizer, scheduler, completed_cycles, completed_updates,
-                        total_planned_updates, best_state, lr_history, rng_states, loader_generator_state,
-                        elapsed_time):
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_type': getattr(scheduler, 'kind', 'cosine'),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'completed_cycles': completed_cycles,
-        'completed_updates': completed_updates,
-        'total_planned_updates': total_planned_updates,
-        'best_state': best_state,
-        'lr_history': lr_history,
-        'rng_states': rng_states,
-        'loader_generator_state': loader_generator_state,
-        'elapsed_time': elapsed_time,
-        }, osp.join(path, 'training_state.pth'))
+    return tr_logits, tr_labels, tr_loss, tr_comps
 
 def train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, exp_path,
-                start_cycle=0, best_state=None, lr_history=None, elapsed_time=0.0, resume_from=None):
+                epoch_checkpointing_from=0, metric_tolerances=None, do_not_save=False,
+                structural_target_builder=None, structural_saliency_weight=0.0,
+                resume_state=None):
 
     n_cycles = len(scheduler.cycle_lens)
-    if best_state is None:
-        best_state = {'best_auc': 0, 'best_dice': 0, 'best_cycle': 0, 'best_monitoring_metric': 0}
-    best_auc, best_dice, best_cycle = best_state['best_auc'], best_state['best_dice'], best_state['best_cycle']
-    best_monitoring_metric = best_state['best_monitoring_metric']
-    is_better, _ = compare_op(metric)
+    policy = parse_metric_policy(metric, metric_tolerances)
+    order = policy['metric_order']
+    tolerances = policy['metric_tolerances']
+    incumbent = resume_state.get('incumbent') if resume_state else None
+    selection_stats = resume_state.get('selection_stats') if resume_state else None
+    max_validation_auc_seen = resume_state.get('max_validation_auc_seen') if resume_state else None
+    global_epoch = resume_state.get('completed_epochs', 0) if resume_state else 0
+    completed_epochs = global_epoch
+    start_cycle = resume_state.get('next_cycle', 0) if resume_state else 0
+    history_path = osp.join(exp_path, 'checkpoint_history.jsonl') if exp_path and not do_not_save else None
+    # Display-only weight for the training-only structural-saliency component.
+    extra_weights = {'structural_saliency': structural_saliency_weight} if structural_saliency_weight > 0 else None
 
-    train_log = None
-    if exp_path is not None:
-        train_log = open(osp.join(exp_path, 'train_log.jsonl'), 'a')
+    def rng_state():
+        return (random.getstate(), np.random.get_state(), torch.get_rng_state(),
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None)
 
-    train_time_start = time.time()
+    def restore_rng(state):
+        random.setstate(state[0]); np.random.set_state(state[1]); torch.set_rng_state(state[2])
+        if state[3] is not None:
+            torch.cuda.set_rng_state_all(state[3])
+
+    def assess_and_select(tr_logits, tr_labels, tr_loss, tr_comps, cycle, epoch_in_cycle,
+                          is_cycle_end, progress_write=print):
+        nonlocal incumbent, selection_stats, max_validation_auc_seen, global_epoch
+        tr_auc, tr_dice = evaluate(tr_logits, tr_labels, model.n_classes)
+        del tr_logits, tr_labels
+        state = None if is_cycle_end else rng_state()
+        was_training = model.training
+        try:
+            with torch.no_grad():
+                vl_logits, vl_labels, vl_loss, _, vl_comps = run_one_epoch(val_loader, model, criterion, assess=True)
+                vl_auc, vl_dice = evaluate(vl_logits, vl_labels, model.n_classes)
+                del vl_logits, vl_labels
+        finally:
+            model.train(was_training)
+            if state is not None:
+                restore_rng(state)
+        current = {'auc': float(vl_auc), 'dice': float(vl_dice), 'loss': float(vl_loss), 'tr_auc': float(tr_auc)}
+        max_validation_auc_seen = current['auc'] if max_validation_auc_seen is None else max(max_validation_auc_seen, current['auc'])
+        selected, reason, details = compare_checkpoint(current, incumbent, order, tolerances)
+        gate_summary = None
+        if hasattr(model, 'bridge_gate_summary'):
+            gate_summary = model.bridge_gate_summary()
+        record = {'cycle': cycle, 'epoch_in_cycle': epoch_in_cycle, 'global_epoch': global_epoch,
+                  'metrics': current, 'incumbent_metrics': incumbent, 'comparison_reason': reason,
+                  'selected': selected, 'saved': False}
+        if gate_summary:
+            record['bridge_gates'] = gate_summary
+        if selected:
+            if epoch_checkpointing_from > 0 and cycle + 1 >= epoch_checkpointing_from:
+                progress_write('------------------------- Epoch {} -------------------------'.format(global_epoch))
+            if gate_summary:
+                progress_write('Bridge gates: {}'.format(gate_summary))
+            progress_write('Train/Val Loss: {:.4f}/{:.4f} -- Train/Val AUC: {:.4f}/{:.4f} -- Train/Val DICE: {:.4f}/{:.4f} -- LR={:.6f}'.format(
+                tr_loss, vl_loss, tr_auc, vl_auc, tr_dice, vl_dice, get_lr(optimizer)).rstrip('0'))
+            if tr_comps: progress_write(format_loss_components('Train', tr_comps, criterion, extra_weights=extra_weights))
+            if vl_comps: progress_write(format_loss_components('Val', vl_comps, criterion))
+            previous = incumbent
+            incumbent = current.copy()
+            selection_stats = {'selection_policy_version': 1, 'epoch_checkpointing_from': epoch_checkpointing_from,
+                'metric_order': order, 'metric_tolerances': tolerances, 'selected_metrics': incumbent,
+                'best_cycle': cycle, 'best_epoch_in_cycle': epoch_in_cycle, 'best_global_epoch': global_epoch,
+                'selection_reason': reason, 'max_validation_auc_seen': max_validation_auc_seen}
+            if gate_summary:
+                selection_stats['bridge_gates'] = gate_summary
+            if previous is None:
+                progress_write('Best checkpoint initialized: {}={:.8f} (cycle {}, epoch {}, global epoch {})'.format(
+                    reason if reason in current else order[0], current[reason] if reason in current else current[order[0]],
+                    cycle, epoch_in_cycle, global_epoch))
+            else:
+                previous_metric, candidate_metric = format_metric_transition(
+                    previous.get(reason, float('nan')), current.get(reason, float('nan')))
+                progress_write('Best {} attained: incumbent={} -> candidate={} (cycle {}, epoch {}, global epoch {})'.format(
+                    reason, previous_metric, candidate_metric,
+                    cycle, epoch_in_cycle, global_epoch))
+            if exp_path and not do_not_save:
+                progress_write('-------------------------  Checkpointing  -------------------------')
+                save_model(exp_path, model, optimizer, stats=selection_stats)
+                record['saved'] = True
+        if history_path:
+            with open(history_path, 'a') as history:
+                history.write(json.dumps(record) + '\n')
+        return current
 
     for cycle in range(start_cycle, n_cycles):
         print('Cycle {:d}/{:d}'.format(cycle+1, n_cycles))
-        # train one cycle, retrieve segmentation data and compute metrics at the end of cycle
-        first_epoch = sum(scheduler.cycle_lens[:cycle])
-        epoch_records = []
-        tr_logits, tr_labels, tr_loss = train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle,
-                                                        lr_log=lr_history, epoch_log=epoch_records, first_epoch=first_epoch)
-        if train_log is not None:
-            for rec in epoch_records:
-                train_log.write(json.dumps(dict(rec, type='epoch')) + '\n')
-
-        # classification metrics at the end of cycle
-        print(25 * '-' + '  End of cycle, evaluating ' + 25 * '-')
-        tr_auc, tr_dice = evaluate(tr_logits, tr_labels, model.n_classes)  # for n_classes>1, will need to redo evaluate
-        del tr_logits, tr_labels
-        with torch.no_grad():
-            assess=True
-            vl_logits, vl_labels, vl_loss, _ = run_one_epoch(val_loader, model, criterion, assess=assess)
-            vl_auc, vl_dice = evaluate(vl_logits, vl_labels, model.n_classes)  # for n_classes>1, will need to redo evaluate
-            del vl_logits, vl_labels
-        print('Train/Val Loss: {:.4f}/{:.4f}  -- Train/Val AUC: {:.4f}/{:.4f}  -- Train/Val DICE: {:.4f}/{:.4f} -- LR={:.6f}'.format(
-                tr_loss, vl_loss, tr_auc, vl_auc, tr_dice, vl_dice, get_lr(optimizer)).rstrip('0'))
-
-        # check if performance was better than anyone before and checkpoint if so
-        if metric == 'auc':
-            monitoring_metric = vl_auc
-        elif metric == 'tr_auc':
-            monitoring_metric = tr_auc
-        elif metric == 'loss':
-            monitoring_metric = vl_loss
-        elif metric == 'dice':
-            monitoring_metric = vl_dice
-        checkpointed = False
-        if is_better(monitoring_metric, best_monitoring_metric):
-            print('Best {} attained. {:.2f} --> {:.2f}'.format(metric, 100*best_monitoring_metric, 100*monitoring_metric))
-            best_auc, best_dice, best_cycle = vl_auc, vl_dice, cycle+1
-            best_monitoring_metric = monitoring_metric
-            if exp_path is not None:
-                print(25 * '-', ' Checkpointing ', 25 * '-')
-                save_model(exp_path, model, optimizer)
-                checkpointed = True
-
-        completed_updates = len(lr_history) if lr_history is not None else None
-        if train_log is not None:
-            train_log.write(json.dumps({'type': 'cycle_end', 'cycle': cycle+1,
-                                        'completed_updates': completed_updates,
-                                        'tr_loss': float(tr_loss), 'vl_loss': float(vl_loss),
-                                        'tr_auc': float(tr_auc), 'vl_auc': float(vl_auc),
-                                        'tr_dice': float(tr_dice), 'vl_dice': float(vl_dice),
-                                        'monitoring_metric': metric,
-                                        'monitoring_metric_value': float(monitoring_metric),
-                                        'checkpointed': checkpointed,
-                                        'lr_end_of_cycle': float(get_lr(optimizer))}) + '\n')
-            train_log.flush()
-        if exp_path is not None and lr_history is not None:
-            with open(osp.join(exp_path, 'lr_history.json'), 'w') as f:
-                json.dump(lr_history, f)
-        # full state for exact resumption (model, optimizer, schedule position, RNGs)
-        if exp_path is not None and lr_history is not None:
-            elapsed = elapsed_time + (time.time() - train_time_start)
-            generator_state = None
-            if getattr(train_loader, 'generator', None) is not None:
-                generator_state = train_loader.generator.get_state()
-            save_training_state(exp_path, model, optimizer, scheduler,
-                                completed_cycles=cycle+1, completed_updates=completed_updates,
-                                total_planned_updates=getattr(scheduler, 'total_updates', None),
-                                best_state={'best_auc': best_auc, 'best_dice': best_dice,
-                                            'best_cycle': best_cycle,
-                                            'best_monitoring_metric': best_monitoring_metric},
-                                lr_history=lr_history, rng_states=get_rng_states(),
-                                loader_generator_state=generator_state, elapsed_time=elapsed)
-
-    if train_log is not None:
-        train_log.close()
-    total_elapsed = elapsed_time + (time.time() - train_time_start)
-    if exp_path is not None and lr_history is not None:
-        with open(osp.join(exp_path, 'training_time.txt'), 'w') as f:
-            print('total_optimizer_updates: {}'.format(len(lr_history)), file=f)
-            print('planned_total_optimizer_updates: {}'.format(getattr(scheduler, 'total_updates', 'n/a')), file=f)
-            print('wall_time_seconds: {:.1f}'.format(total_elapsed), file=f)
-            print('resumed_from: {}'.format(resume_from), file=f)
+        cycle_start = completed_epochs
+        def callback(*args):
+            nonlocal global_epoch
+            global_epoch = cycle_start + args[5]
+            return assess_and_select(*args)
+        train_one_cycle(train_loader, model, criterion, optimizer, scheduler, grad_acc_steps, cycle,
+                        epoch_checkpointing_from=epoch_checkpointing_from, epoch_callback=callback,
+                        structural_target_builder=structural_target_builder,
+                        structural_saliency_weight=structural_saliency_weight)
+        completed_epochs += scheduler.cycle_lens[cycle]
+        if exp_path and not do_not_save:
+            save_training_state(exp_path, model, optimizer, scheduler, cycle + 1,
+                                completed_epochs, incumbent, selection_stats,
+                                max_validation_auc_seen, policy, scheduler.cycle_lens)
+        print('-' * shutil.get_terminal_size(fallback=(80, 24)).columns)
 
     del model
     torch.cuda.empty_cache()
-    return best_auc, best_dice, best_cycle
+    if selection_stats is None:
+        return {'val_auc': None, 'val_dice': None, 'val_loss': None, 'best_cycle': 0,
+                'best_epoch_in_cycle': 0, 'best_global_epoch': 0, 'selected_metrics': None}
+    return {'val_auc': selection_stats['selected_metrics'].get('auc'),
+            'val_dice': selection_stats['selected_metrics'].get('dice'),
+            'val_loss': selection_stats['selected_metrics'].get('loss'),
+            'best_cycle': selection_stats['best_cycle'], 'best_epoch_in_cycle': selection_stats['best_epoch_in_cycle'],
+            'best_global_epoch': selection_stats['best_global_epoch'], 'selected_metrics': selection_stats['selected_metrics']}
 
 if __name__ == '__main__':
     '''
@@ -314,29 +528,86 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    try:
+        selection_policy = parse_metric_policy(args.metric, args.metric_tolerances)
+    except ValueError as e:
+        parser.error(str(e))
+
+    try:
+        resolve_arch_args(args)
+    except ValueError as e:
+        parser.error(str(e))
+    args.metric = selection_policy['metric']
+    args.metric_order = selection_policy['metric_order']
+    args.resolved_metric_tolerances = selection_policy['metric_tolerances']
+
+    # Validate mutually dependent augmentation options before training.
+    validate_freesdg_args(args)
+    if args.freesdg:
+        if not (0.0 <= args.freesdg_raw_prob <= 1.0):
+            sys.exit('--freesdg_raw_prob must be within [0, 1]')
+        if args.freesdg_mixup_size == 0 or args.freesdg_mixup_size < -1:
+            sys.exit('--freesdg_mixup_size must be -1 (random) or > 0 (fixed square); 0 is not a valid mode')
+
+    # Cross-stage bridge validation/canonicalization (A1): canonical values are
+    # what get serialized into config.cfg and passed to get_arch().
+    try:
+        args.cross_stage_bridge, args.cross_stage_bridge_scales, args.cross_stage_bridge_init = \
+            validate_cross_stage_bridge(
+                args.cross_stage_bridge, args.cross_stage_bridge_scales,
+                args.cross_stage_bridge_init, args.model_name)
+    except ValueError as e:
+        parser.error(str(e))
+
+    im_size_tmp = tuple([int(item) for item in args.im_size.split(',')])
+    tg_size_tmp = (im_size_tmp[0], im_size_tmp[0]) if len(im_size_tmp) == 1 else tuple(im_size_tmp[:2])
+    if args.freesdg and args.freesdg_mix_policy == 'paper' and tg_size_tmp != (512, 512):
+        sys.exit('--freesdg_mix_policy paper requires 512x512 input (--im_size 512)')
+
+    if args.freesdg:
+        freesdg_cfg = {
+            'enabled': True,
+            'raw_prob': args.freesdg_raw_prob,
+            'test_input': args.freesdg_test_input,
+            'anchor_w': args.freesdg_anchor_w,
+            'anchor_sigma': args.freesdg_anchor_sigma,
+            'ratio': args.freesdg_ratio,
+            'mixup_size': args.freesdg_mixup_size,
+            'mix_policy': args.freesdg_mix_policy,
+            'seed': args.freesdg_seed,
+            'aug_mode': args.freesdg_aug_mode,
+            'lwnet_aug_profile': args.freesdg_lwnet_aug_profile,
+            'disable_aug_color_jitter': args.freesdg_disable_aug_color_jitter,
+            'device': args.device,
+        }
+    else:
+        freesdg_cfg = None
+
+    if args.freesdg_disable_aug_color_jitter:
+        print('* FreeSDG post-frequency transforms: raw=original, '
+              'augmented=original_without_color_jitter')
+
     if args.device.startswith("cuda"):
-        # In case one has multiple devices, we must first set the one
-        # we would like to use so pytorch can find it.
-        os.environ['CUDA_VISIBLE_DEVICES'] = args.device.split(":",1)[1]
         if not torch.cuda.is_available():
             raise RuntimeError("cuda is not currently available!")
-        print('* Training on device '.format(args.device))
-        device = torch.device("cuda")
+        print('* Training on device {}'.format(args.device))
+        device = torch.device(args.device)
     else:  #cpu
         device = torch.device(args.device)
 
     # reproducibility
-    seed_value = args.seed
-    set_seeds(seed_value, args.device.startswith("cuda"))
+    set_seeds(args.seed, args.device.startswith("cuda"))
 
     # gather parser parameters
     model_name = args.model_name
     max_lr, min_lr, bs, grad_acc_steps = args.max_lr, args.min_lr, args.batch_size, args.grad_acc_steps
-    cycle_lens, metric = args.cycle_lens.split('/'), args.metric
+    cycle_lens, metric = args.cycle_lens.split('/'), selection_policy['metric']
     cycle_lens = list(map(int, cycle_lens))
 
     if len(cycle_lens)==2: # handles option of specifying cycles as pair (n_cycles, cycle_len)
         cycle_lens = cycle_lens[0]*[cycle_lens[1]]
+    if args.epoch_checkpointing_from < 0 or args.epoch_checkpointing_from > len(cycle_lens):
+        parser.error('--epoch_checkpointing_from must be 0 or between 1 and the cycle count ({})'.format(len(cycle_lens)))
 
     im_size = tuple([int(item) for item in args.im_size.split(',')])
     if isinstance(im_size, tuple) and len(im_size)==1:
@@ -346,47 +617,8 @@ if __name__ == '__main__':
     else:
         sys.exit('im_size should be a number or a tuple of two numbers')
 
-    ### QUERY MODE: print the highest lr the run will ever hit, and where
-    if args.dc_show_max_lr:
-        import pandas as pd
-        n_images = len(pd.read_csv(args.csv_train))
-        updates_per_epoch = math.ceil(math.ceil(n_images / bs) / (grad_acc_steps + 1))
-        total_updates = updates_per_epoch * sum(cycle_lens)
-        period = args.dc_period if args.dc_period != 0 else 2 * cycle_lens[0] * updates_per_epoch
-        try:
-            validate_damped_cosine_config(total_updates, period, args.dc_alpha, args.dc_d,
-                                          max_lr, min_lr, inflate_max_lr=args.dc_inflate_max_lr)
-        except DampedCosineError as e:
-            sys.exit('invalid damped_cosine configuration: {}'.format(e))
-        best_lr, best_t, ties = damped_cosine_schedule_max(total_updates, period, args.dc_alpha,
-                                                           args.dc_d, max_lr, min_lr,
-                                                           inflate_max_lr=args.dc_inflate_max_lr)
-        # locate best_t inside the cycle/epoch grid
-        global_epoch0 = best_t // updates_per_epoch  # 0-based global epoch
-        rem, cycle, epoch_in_cycle = global_epoch0, len(cycle_lens), cycle_lens[-1]
-        for c, clen in enumerate(cycle_lens, 1):
-            if rem < clen:
-                cycle, epoch_in_cycle = c, rem + 1
-                break
-            rem -= clen
-        print('* damped_cosine over {} cycles x {} epochs ({} optimizer updates, {}/epoch, period {}):'.format(
-            len(cycle_lens), cycle_lens[0], total_updates, updates_per_epoch, period))
-        print('  highest lr ever hit: {:.6e}  (alpha={}, d={}, lr_max={}, lr_min={}, inflate_max_lr={})'.format(
-            best_lr, args.dc_alpha, args.dc_d, max_lr, min_lr, args.dc_inflate_max_lr))
-        print('  first reached at: cycle {}/{}, epoch {}/{} (global epoch {}, optimizer update {}/{})'.format(
-            cycle, len(cycle_lens), epoch_in_cycle, cycle_lens[cycle-1],
-            global_epoch0 + 1, best_t + 1, total_updates))
-        if ties > 1:
-            print('  note: {} updates reach this same value (repeated capped peaks)'.format(ties))
-        if args.scheduler == 'cosine':
-            print('  note: --scheduler cosine is active; the original schedule peaks at max_lr = {} '
-                  'every second cycle'.format(max_lr))
-        if args.csv_test is not None:
-            print('  note: query ignores --csv_test; pseudo-label-extended datasets have more updates/epoch')
-        sys.exit(0)
-
     do_not_save = str2bool(args.do_not_save)
-    if do_not_save is False:
+    if do_not_save is False and not args.dc_show_max_lr:
         save_path = args.save_path
         if save_path == 'date_time':
             save_path = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
@@ -395,8 +627,7 @@ if __name__ == '__main__':
         os.makedirs(experiment_path, exist_ok=True)
 
         config_file_path = osp.join(experiment_path,'config.cfg')
-        with open(config_file_path, 'w') as f:
-            json.dump(vars(args), f, indent=2)
+        write_training_config(args, config_file_path)
     else: experiment_path=None
 
     csv_train = args.csv_train
@@ -410,9 +641,37 @@ if __name__ == '__main__':
         n_classes=1
         label_values = [0, 255]
 
+    # Validate structural-saliency settings before constructing the model.
+    try:
+        validate_structural_saliency(
+            args.structural_saliency, args.model_name, n_classes, args.in_c,
+            args.structural_saliency_weight, args.structural_saliency_kernel,
+            args.structural_saliency_sigma, args.structural_saliency_ratio)
+    except ValueError as e:
+        parser.error(str(e))
+
+    # Composable segmentation criterion, built once through the generic builder,
+    # outside all FreeSDG/Raffe conditionals: vanilla LwNet and every
+    # augmentation variant use exactly the same criterion. Validation runs once
+    # here so misconfiguration fails before anything is created.
+    if n_classes == 1:
+        try:
+            criterion = build_segmentation_loss(args)
+        except ValueError as e:
+            sys.exit('Invalid loss configuration: {}'.format(e))
+    else: # artery-vein segmentation keeps its original criterion untouched
+        criterion = torch.nn.CrossEntropyLoss()
+    # Generic boundary-loss requirement for the target-preparation path:
+    # derived only from loss_boundary_weight > 0 (never from --freesdg).
+    need_distance_map = bool(getattr(criterion, 'need_distance_map', False))
+
+    print('* Instantiating loss function', str(criterion))
+    if hasattr(criterion, 'formula'):
+        print('* Loss formula:', criterion.formula)
+
 
     print("* Creating Dataloaders, batch size = {}, workers = {}".format(bs, args.num_workers))
-    train_loader, val_loader = get_train_val_loaders(csv_path_train=csv_train, csv_path_val=csv_val, batch_size=bs, tg_size=tg_size, label_values=label_values, num_workers=args.num_workers, seed=seed_value)
+    train_loader, val_loader = get_train_val_loaders(csv_path_train=csv_train, csv_path_val=csv_val, batch_size=bs, tg_size=tg_size, label_values=label_values, num_workers=args.num_workers, freesdg_cfg=freesdg_cfg, need_distance_map=need_distance_map, need_structural_saliency=args.structural_saliency)
 
     # grad_acc_steps: if I want to train with a fake_bs=K but the actual bs I want is bs=N, then you use
     # grad_acc_steps = N/K - 1.
@@ -420,18 +679,62 @@ if __name__ == '__main__':
     # Example: bs=4, fake_bs=2 -> grad_acc_steps = 1
     # Example: bs=4, fake_bs=1 -> grad_acc_steps = 3
 
+
     print('* Instantiating a {} model'.format(model_name))
-    model = get_arch(model_name, in_c=args.in_c, n_classes=n_classes)
+    arch_opts = get_arch_options(args)
+    model = get_arch(model_name, in_c=args.in_c, n_classes=n_classes, **arch_opts)
     model = model.to(device)
 
     print("Total params: {0:,}".format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
+    print('* Architecture summary:')
+    print('  model_name={}'.format(model_name))
+    print('  U1=LittleUNet[8,16,32]')
+    print('  U2 family={}'.format(args.u2_arch))
+    if args.u2_arch == 'fr_multi':
+        print('  FR variant={}'.format('lite' if args.fr_lite else 'full'))
+        print('  FR base channels={}'.format(args.fr_u2_base_channels))
+        print('  FR dilations={}'.format(format_fr_u2_dilations(args.fr_u2_dilations)))
+        if args.fr_lite:
+            print('  FR channels=4/8/16')
+            print('  FR fusion stages=3')
+    print('  cross_stage_bridge={} scales={} init={}'.format(
+        args.cross_stage_bridge, args.cross_stage_bridge_scales, args.cross_stage_bridge_init))
+    print('  structural_saliency={}'.format(args.structural_saliency))
+    print('  trainable_params={}'.format(
+        sum(p.numel() for p in model.parameters() if p.requires_grad)))
     optimizer = torch.optim.Adam(model.parameters(), lr=max_lr)
+
+    # Structural-saliency target builder is constructed once, on the
+    # training device, with no trainable parameters. Never part of the model or
+    # the optimizer.
+    structural_target_builder = None
+    if args.structural_saliency:
+        structural_target_builder = StructuralSaliencyTarget(
+            kernel_size=args.structural_saliency_kernel,
+            sigma=args.structural_saliency_sigma,
+            ratio=args.structural_saliency_ratio,
+        ).to(device)
+        structural_target_builder.eval()
+        print('Structural saliency self-supervision: ENABLED')
+        print('  decoder branch: U-Net 1 encoder -> auxiliary U-Net decoder')
+        print('  output channels: 3')
+        print('  reconstruction loss: MSE')
+        print('  weight: {}'.format(args.structural_saliency_weight))
+        print('  Gaussian kernel: {}'.format(args.structural_saliency_kernel))
+        print('  Gaussian sigma: {}'.format(args.structural_saliency_sigma))
+        print('  HFC ratio: {}'.format(args.structural_saliency_ratio))
+        print('  target source: geometrically synchronized non-frequency-augmented RGB image')
+        print('  inference branch: disabled')
+    else:
+        print('Structural saliency self-supervision: disabled')
 
     ### TRAINING WITH PSEUDO-LABELS
     csv_test = args.csv_test
     path_test_preds = args.path_test_preds
     checkpoint_folder = args.checkpoint_folder
     if csv_test is not None:
+        if args.resume_from:
+            parser.error('--resume_from cannot be combined with pseudo-label warm-start training')
         print('Training with pseudo-labels, completing training set with predictions on test set')
         from utils.get_loaders import build_pseudo_dataset
         tr_im_list, tr_gt_list, tr_mask_list = build_pseudo_dataset(csv_train, csv_test, path_test_preds)
@@ -447,92 +750,86 @@ if __name__ == '__main__':
 
 
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=cycle_lens[0] * len(train_loader), eta_min=0)
-    # number of optimizer updates per epoch: one update every (grad_acc_steps+1) batches
-    # (computed after the pseudo-label branch above, so an extended train set is accounted for)
-    updates_per_epoch = math.ceil(len(train_loader) / (grad_acc_steps + 1))
-    total_planned_updates = updates_per_epoch * sum(cycle_lens)
-
     if args.scheduler == 'damped_cosine':
-        # original scheduler oscillation spans TWO cycles (decay over one cycle of
-        # T_max = cycle_lens[0]*len(train_loader) steps, rise over the next), so the
-        # matching damped-cosine period is 2*cycle_lens[0]*updates_per_epoch.
-        dc_period = args.dc_period if args.dc_period != 0 else 2 * cycle_lens[0] * updates_per_epoch
+        updates_per_epoch = (len(train_loader) + grad_acc_steps) // (grad_acc_steps + 1)
+        total_updates = updates_per_epoch * sum(cycle_lens)
+        period = args.dc_period or (2 * cycle_lens[0] * updates_per_epoch)
+        inflate_cap = args.dc_inflate_max_lr if args.dc_alpha < 0 else None
         try:
-            validate_damped_cosine_config(total_planned_updates, dc_period, args.dc_alpha, args.dc_d,
-                                          max_lr, min_lr, inflate_max_lr=args.dc_inflate_max_lr)
-        except DampedCosineError as e:
-            sys.exit('invalid damped_cosine configuration: {}'.format(e))
-        scheduler = DampedCosineLRSchedule(optimizer, total_updates=total_planned_updates,
-                                           period=dc_period, alpha=args.dc_alpha, d=args.dc_d,
-                                           lr_max=max_lr, lr_min=min_lr,
-                                           inflate_max_lr=args.dc_inflate_max_lr)
+            validate_damped_cosine_config(
+                total_updates, period, args.dc_alpha, args.dc_d,
+                max_lr, min_lr, inflate_max_lr=inflate_cap)
+        except DampedCosineError as exc:
+            parser.error(str(exc))
+        if args.dc_show_max_lr:
+            peak, peak_update, ties = damped_cosine_schedule_max(
+                total_updates, period, args.dc_alpha, args.dc_d,
+                max_lr, min_lr, inflate_max_lr=inflate_cap)
+            print('damped_cosine_max_lr: {:.12g}'.format(peak))
+            print('damped_cosine_max_lr_update: {}'.format(peak_update))
+            print('damped_cosine_max_lr_ties: {}'.format(ties))
+            print('damped_cosine_total_updates: {}'.format(total_updates))
+            print('damped_cosine_period: {}'.format(period))
+            sys.exit(0)
+        scheduler = DampedCosineLRSchedule(
+            optimizer, total_updates, period, args.dc_alpha, args.dc_d,
+            max_lr, min_lr, inflate_max_lr=inflate_cap)
+        scheduler.kind = 'damped_cosine'
     else:
-        # original scheduler, behavior preserved exactly (note: eta_min=0 regardless of --min_lr)
-        scheduler = CosineAnnealingLR(optimizer, T_max=cycle_lens[0] * len(train_loader), eta_min=0)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cycle_lens[0] * len(train_loader), eta_min=0)
+        scheduler.kind = 'cosine'
     setattr(optimizer, 'max_lr', max_lr)  # store it inside the optimizer for accessing to it later
     setattr(scheduler, 'cycle_lens', cycle_lens)
-    setattr(scheduler, 'kind', args.scheduler)
-    setattr(scheduler, 'total_updates', total_planned_updates)
 
-    print('* Scheduler: {} -- {} planned optimizer updates ({} per epoch x {} epochs)'.format(
-        args.scheduler, total_planned_updates, updates_per_epoch, sum(cycle_lens)))
-    if args.scheduler == 'damped_cosine':
-        print('  damped_cosine: alpha={}, d={}, period={} updates, lr_max={}, lr_min={}, inflate_max_lr={}'.format(
-            args.dc_alpha, args.dc_d, dc_period, max_lr, min_lr, args.dc_inflate_max_lr))
-
-    # (re)save config including resolved schedule information
-    if do_not_save is False:
-        with open(config_file_path, 'w') as f:
-            cfg = dict(vars(args))
-            cfg['total_planned_updates'] = total_planned_updates
-            cfg['updates_per_epoch'] = updates_per_epoch
-            cfg['dc_period_resolved'] = dc_period if args.scheduler == 'damped_cosine' else None
-            json.dump(cfg, f, indent=2)
-
-    ### RESUMING A PREVIOUS RUN
-    start_cycle, best_state, lr_history, elapsed_time = 0, None, [], 0.0
-    if args.resume_from is not None:
-        state_path = osp.join(args.resume_from, 'training_state.pth')
-        if not osp.isfile(state_path):
-            sys.exit('cannot resume: {} not found (training_state.pth is saved at the end of each cycle)'.format(state_path))
-        state = torch.load(state_path, map_location=device, weights_only=False)
-        # consistency checks: never resume a run whose plan differs from the saved one
-        if state['scheduler_type'] != args.scheduler:
-            sys.exit('cannot resume: run was trained with scheduler "{}", but --scheduler {} was given'.format(
-                state['scheduler_type'], args.scheduler))
-        if state['total_planned_updates'] != total_planned_updates:
-            sys.exit('cannot resume: planned total optimizer updates changed (saved {}, now {})'.format(
-                state['total_planned_updates'], total_planned_updates))
-        model.load_state_dict(state['model_state_dict'])
-        optimizer.load_state_dict(state['optimizer_state_dict'])
-        # restores the schedule position without resetting decay or recomputing
-        # the horizon (DampedCosineLRSchedule.load_state_dict also restores T)
-        scheduler.load_state_dict(state['scheduler_state_dict'])
-        start_cycle = state['completed_cycles']
-        best_state = state['best_state']
-        lr_history = list(state['lr_history'])
-        elapsed_time = state.get('elapsed_time', 0.0)
-        set_rng_states(state['rng_states'])
-        if getattr(train_loader, 'generator', None) is not None and state.get('loader_generator_state') is not None:
-            train_loader.generator.set_state(state['loader_generator_state'])
-        print('* Resuming from {} at cycle {}/{} ({} optimizer updates done)'.format(
-            args.resume_from, start_cycle, len(cycle_lens), state['completed_updates']))
-
-    criterion = torch.nn.BCEWithLogitsLoss() if model.n_classes == 1 else torch.nn.CrossEntropyLoss()
+    resume_state = None
+    if args.resume_from:
+        resume_path = args.resume_from
+        if osp.isdir(resume_path):
+            resume_file = osp.join(resume_path, 'training_state.pth')
+        else:
+            resume_file = resume_path
+        if not osp.isfile(resume_file):
+            parser.error('resume state not found: {}'.format(resume_file))
+        try:
+            resume_state = torch.load(resume_file, map_location=device)
+            if resume_state.get('schema_version') != 1:
+                raise ValueError('unsupported training-state schema')
+            if list(resume_state.get('cycle_lens', [])) != list(cycle_lens):
+                raise ValueError('cycle_lens mismatch')
+            saved_policy = resume_state.get('metric_policy', {})
+            if saved_policy.get('metric_order') != selection_policy['metric_order']:
+                raise ValueError('metric ordering mismatch')
+            if getattr(scheduler, 'kind', 'cosine') != resume_state.get('scheduler_type'):
+                raise ValueError('scheduler type mismatch')
+            model.load_state_dict(resume_state['model_state_dict'])
+            optimizer.load_state_dict(resume_state['optimizer_state_dict'])
+            if hasattr(scheduler, 'load_state_dict'):
+                scheduler.load_state_dict(resume_state['scheduler_state_dict'])
+            _restore_rng_state(resume_state['rng_states'])
+        except (KeyError, RuntimeError, ValueError, OSError) as exc:
+            parser.error('invalid resume state: {}'.format(exc))
 
 
-    print('* Instantiating loss function', str(criterion))
     print('* Starting to train\n','-' * 10)
 
 
-    m1, m2, m3=train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps, metric, experiment_path,
-                           start_cycle=start_cycle, best_state=best_state, lr_history=lr_history,
-                           elapsed_time=elapsed_time, resume_from=args.resume_from)
+    result = train_model(model, optimizer, criterion, train_loader, val_loader, scheduler, grad_acc_steps,
+                         metric, experiment_path, epoch_checkpointing_from=args.epoch_checkpointing_from,
+                         metric_tolerances=args.metric_tolerances, do_not_save=do_not_save,
+                         structural_target_builder=structural_target_builder,
+                         structural_saliency_weight=args.structural_saliency_weight,
+                         resume_state=resume_state)
 
-    print("val_auc: %f" % m1)
-    print("val_dice: %f" % m2)
-    print("best_cycle: %d" % m3)
+    print("val_auc: %s" % result['val_auc'])
+    print("val_dice: %s" % result['val_dice'])
+    print("val_loss: %s" % result['val_loss'])
+    print("best_cycle: %d" % result['best_cycle'])
+    print("best_epoch_in_cycle: %d" % result['best_epoch_in_cycle'])
+    print("best_global_epoch: %d" % result['best_global_epoch'])
     if do_not_save is False:
+        if result['selected_metrics'] is None:
+            print('No valid checkpoint was selected; validation metrics were non-finite.')
+            sys.exit(1)
         # file = open(osp.join(experiment_path, 'val_metrics.txt'), 'w')
         # file.write(str(m1)+ '\n')
         # file.write(str(m2)+ '\n')
@@ -540,4 +837,6 @@ if __name__ == '__main__':
         # file.close()
 
         with open(osp.join(experiment_path, 'val_metrics.txt'), 'w') as f:
-            print('Best AUC = {:.2f}\nBest DICE = {:.2f}\nBest cycle = {}'.format(100*m1, 100*m2, m3), file=f)
+            print('Best AUC = {:.2f}\nBest DICE = {:.2f}\nBest loss = {:.8f}\nBest cycle = {}\nBest epoch in cycle = {}\nBest global epoch = {}'.format(
+                100 * result['val_auc'], 100 * result['val_dice'], result['val_loss'], result['best_cycle'],
+                result['best_epoch_in_cycle'], result['best_global_epoch']), file=f)

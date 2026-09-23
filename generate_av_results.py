@@ -12,7 +12,7 @@ from skimage.color import label2rgb
 
 import torch
 from utils.model_saving_loading import str2bool
-from models.get_model import get_arch
+from models.get_model import get_arch_from_config
 from utils.get_loaders import get_test_dataset
 from utils.model_saving_loading import load_model
 
@@ -42,9 +42,10 @@ def flip_lrud(tens):
     return torch.flip(tens, dims=[1, 2])
 
 
-def create_pred(model, tens, mask, coords_crop, original_sz, tta='no'):
+def create_pred(model, tens, mask, coords_crop, original_sz, tta='no', device=None):
     act = torch.nn.Softmax(dim=0)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device is None:
+        device = next(model.parameters()).device
     with torch.no_grad():
         logits = model(tens.unsqueeze(dim=0).to(device)).squeeze(dim=0)
     prob = act(logits)
@@ -167,8 +168,7 @@ if __name__ == '__main__':
     print('* Reading test data from ' + osp.join(data_path, csv_path))
     test_dataset = get_test_dataset(data_path, csv_path=csv_path, tg_size=tg_size)
     print('* Instantiating model  = ' + str(model_name))
-    model = get_arch(model_name, n_classes=4).to(device)
-    if 'wnet' in model_name: model.mode = 'eval'
+    model = get_arch_from_config(args, n_classes=4, device=device)
 
     print('* Loading trained weights from ' + experiment_path)
     try:
@@ -181,6 +181,8 @@ if __name__ == '__main__':
     print('* Saving predictions to ' + save_results_path)
     for i in tqdm(range(len(test_dataset))):
         im_tens, mask, coords_crop, original_sz, im_name = test_dataset[i]
-        prob_pred = create_pred(model, im_tens, mask, coords_crop, original_sz, tta=tta)
+        prob_pred = create_pred(
+            model, im_tens, mask, coords_crop, original_sz,
+            tta=tta, device=device)
         save_pred(prob_pred, save_results_path, im_name)
     print('* Done')
