@@ -191,6 +191,17 @@ def get_lr(optimizer):
 def is_damped(scheduler):
     return getattr(scheduler, 'kind', 'cosine') == 'damped_cosine'
 
+def resolve_optimizer_budget(loader_len, grad_acc_steps, cycle_lens, dc_period):
+    """Resolve optimizer-update budget shared by the query and training paths.
+
+    updates_per_epoch matches the loop condition `i_batch % (grad_acc_steps+1) == 0`;
+    period 0 selects the automatic 2 x cycle_lens[0] x updates_per_epoch oscillation.
+    """
+    updates_per_epoch = math.ceil(loader_len / (grad_acc_steps + 1))
+    total_updates = updates_per_epoch * sum(cycle_lens)
+    period = dc_period if dc_period != 0 else 2 * cycle_lens[0] * updates_per_epoch
+    return updates_per_epoch, total_updates, period
+
 def format_loss_components(split, comps, criterion, extra_weights=None):
     # One line of unweighted values, CLI weights, and weighted contributions;
     # disabled terms are simply absent from comps.
@@ -614,9 +625,8 @@ if __name__ == '__main__':
             train_loader_q.dataset.im_list = tr_im_list
             train_loader_q.dataset.gt_list = tr_gt_list
             train_loader_q.dataset.mask_list = tr_mask_list
-        updates_per_epoch = math.ceil(len(train_loader_q) / (grad_acc_steps + 1))
-        total_updates = updates_per_epoch * sum(cycle_lens)
-        period = args.dc_period if args.dc_period != 0 else 2 * cycle_lens[0] * updates_per_epoch
+        updates_per_epoch, total_updates, period = resolve_optimizer_budget(
+            len(train_loader_q), grad_acc_steps, cycle_lens, args.dc_period)
         try:
             validate_damped_cosine_config(total_updates, period, args.dc_alpha, args.dc_d,
                                           max_lr, min_lr, inflate_max_lr=args.dc_inflate_max_lr)
@@ -633,7 +643,7 @@ if __name__ == '__main__':
                 break
             rem -= clen
         print('* damped_cosine over {} cycles x {} epochs ({} optimizer updates, {}/epoch, period {}):'.format(
-            len(cycle_lens), cycle_lens[0], total_updates, updates_per_epoch, period))
+            len(cycle_lens), sum(cycle_lens), total_updates, updates_per_epoch, period))
         print('  highest lr ever hit: {:.6e}  (alpha={}, d={}, lr_max={}, lr_min={}, inflate_max_lr={})'.format(
             best_lr, args.dc_alpha, args.dc_d, max_lr, min_lr, args.dc_inflate_max_lr))
         print('  first reached at: cycle {}/{}, epoch {}/{} (global epoch {}, optimizer update {}/{})'.format(
@@ -776,17 +786,15 @@ if __name__ == '__main__':
 
 
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=cycle_lens[0] * len(train_loader), eta_min=0)
-    # Optimizer updates per epoch: one every (grad_acc_steps+1) batches, matching
-    # the loop condition `i_batch % K == 0`. Computed after the pseudo-label
-    # branch above so an extended train set is accounted for.
-    updates_per_epoch = math.ceil(len(train_loader) / (grad_acc_steps + 1))
-    total_planned_updates = updates_per_epoch * sum(cycle_lens)
+    # Optimizer update budget, computed after the pseudo-label branch above so an
+    # extended train set is accounted for. Shared with the --dc_show_max_lr query.
+    updates_per_epoch, total_planned_updates, dc_period = resolve_optimizer_budget(
+        len(train_loader), grad_acc_steps, cycle_lens, args.dc_period)
 
     if args.scheduler == 'damped_cosine':
         # The original scheduler oscillation spans TWO cycles (decay over one
         # T_max = cycle_lens[0]*len(train_loader) step cycle, rise over the next),
         # so the matching damped-cosine period is 2*cycle_lens[0]*updates_per_epoch.
-        dc_period = args.dc_period if args.dc_period != 0 else 2 * cycle_lens[0] * updates_per_epoch
         try:
             validate_damped_cosine_config(total_planned_updates, dc_period, args.dc_alpha, args.dc_d,
                                           max_lr, min_lr, inflate_max_lr=args.dc_inflate_max_lr)
@@ -802,7 +810,6 @@ if __name__ == '__main__':
     setattr(optimizer, 'max_lr', max_lr)  # store it inside the optimizer for accessing to it later
     setattr(scheduler, 'cycle_lens', cycle_lens)
     setattr(scheduler, 'kind', args.scheduler)
-    setattr(scheduler, 'total_updates', total_planned_updates)
 
     print('* Scheduler: {} -- {} planned optimizer updates ({} per epoch x {} epochs)'.format(
         args.scheduler, total_planned_updates, updates_per_epoch, sum(cycle_lens)))

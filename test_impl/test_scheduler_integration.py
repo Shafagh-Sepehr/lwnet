@@ -37,7 +37,7 @@ def _build_fixture(root, n_train=4, n_val=2, n_test=2):
     for i in range(n_test):
         base = os.path.join(root, 'test{}'.format(i))
         _write_pair(base)
-        Image.open(base + '_gt.png').save(os.path.join(test_preds, 'test{}.png'.format(i)))
+        Image.open(base + '_gt.png').save(os.path.join(test_preds, 'test{}_img.png'.format(i)))
 
     def write_csv(path, rows):
         with open(path, 'w') as f:

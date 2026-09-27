@@ -9,7 +9,8 @@ import torch
 
 from utils.schedulers import (
     DampedCosineError, DampedCosineLRSchedule, damped_cosine_lr,
-    damped_cosine_schedule_max, validate_damped_cosine_config,
+    damped_cosine_max_lr, damped_cosine_schedule_max,
+    validate_damped_cosine_config,
 )
 
 
@@ -124,6 +125,18 @@ class MaxQueryTests(unittest.TestCase):
         best_lr, best_t, ties = damped_cosine_schedule_max(1, 1, 3.0, 0.95, 0.01, 1e-8)
         self.assertAlmostEqual(best_lr, 0.01, places=15)
         self.assertEqual((best_t, ties), (0, 1))
+
+    def test_envelope_ceiling_bounds_oscillation(self):
+        total, period, alpha, d = 120, 30, 3.0, 0.95
+        for t in range(total):
+            ceiling = damped_cosine_max_lr(t, total, alpha, 0.01, 0.0)
+            self.assertGreaterEqual(
+                ceiling + 1e-15,
+                damped_cosine_lr(t, total, period, alpha, d, 0.01, 0.0))
+        # at a cosine peak the ceiling and the actual rate coincide
+        self.assertAlmostEqual(
+            damped_cosine_max_lr(0, total, alpha, 0.01, 0.0),
+            damped_cosine_lr(0, total, period, alpha, d, 0.01, 0.0), places=15)
 
 
 class ValidationTests(unittest.TestCase):

@@ -187,10 +187,6 @@ class DampedCosineLRSchedule:
             self.last_update = self.total_updates - 1
         self._apply_lr(self.last_update)
 
-    def get_last_lr(self):
-        return [self._lr_for_group(self.last_update, g_max, g_min)
-                for g_max, g_min in zip(self.group_lr_max, self.group_lr_min)]
-
     def state_dict(self):
         return {
             'total_updates': self.total_updates,
