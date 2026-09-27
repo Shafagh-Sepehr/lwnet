@@ -224,7 +224,7 @@ The schedule follows a closed-form full-cosine oscillation with an envelope over
 - `--dc_alpha` (default `3.0`): envelope decay strength. `alpha > 0` damps the peaks over training; `alpha = 0` removes the envelope decay (but is *not* the original cosine schedule); `-1 < alpha < 0` inflates the peaks over training. Values `<= -1` are rejected.
 - `--dc_d` (default `0.95`): oscillation depth in `[0, 1]`. With `d < 1` the trough does not reach `--min_lr` exactly.
 - `--dc_period` (default `0`): oscillation period in optimizer updates. `0` selects an automatic period of `2 x cycle_lens[0] x updates_per_epoch`, matching the original scheduler's two-cycle oscillation.
-- `--dc_inflate_max_lr` (default `0.1`): hard cap on the learning rate in inflation mode (`alpha < 0`). It must be greater than `--max_lr`; it has no effect for `alpha >= 0`.
+- `--dc_inflate_max_lr` (default `0.1`): hard cap on the learning rate in inflation mode (`alpha < 0`). It is validated and applied only when `alpha < 0`, where it must be a finite value greater than `--max_lr`. For `alpha >= 0` it is ignored, so a non-inflating run is never constrained by it.
 
 `--max_lr` is the *initial* peak (`lr(0) = max_lr`). Negative `alpha` can raise later peaks above it, up to `--dc_inflate_max_lr`. The scheduler paces itself by actual optimizer updates, so it respects `--grad_acc_steps` (exactly one step per update), unlike the original cosine schedule, which steps `grad_acc_steps + 1` times per update. When training with pseudo-labels, the update count is computed from the extended training set.
 

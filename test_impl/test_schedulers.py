@@ -161,6 +161,46 @@ class ValidationTests(unittest.TestCase):
             validate_damped_cosine_config(10, 10, -0.5, 0.95, 0.01, 0.0,
                                           inflate_max_lr=0.005)
 
+    def test_non_inflating_run_ignores_low_inflation_cap(self):
+        # alpha >= 0 never inflates, so a cap below lr_max must be ignored
+        # rather than clamping the envelope (this is the --dc_alpha 3 --max_lr 0.2
+        # case with the default cap of 0.1).
+        validate_damped_cosine_config(10, 10, 3.0, 0.95, 0.2, 1e-8,
+                                      inflate_max_lr=0.1)
+        self.assertAlmostEqual(
+            damped_cosine_lr(0, 10, 10, 3.0, 0.95, 0.2, 1e-8, inflate_max_lr=0.1),
+            0.2, places=15)
+
+    def test_non_inflating_constructor_ignores_low_inflation_cap(self):
+        optimizer = _make_optimizer(lrs=(0.2,))
+        DampedCosineLRSchedule(optimizer, total_updates=10, period=10, alpha=3.0,
+                               d=0.95, lr_max=0.2, lr_min=1e-8, inflate_max_lr=0.1)
+        self.assertAlmostEqual(optimizer.param_groups[0]['lr'], 0.2, places=15)
+
+    def test_rejects_non_finite_alpha(self):
+        for bad in (float('nan'), float('inf'), float('-inf')):
+            with self.assertRaises(DampedCosineError):
+                validate_damped_cosine_config(10, 10, bad, 0.95, 0.01, 0.0)
+
+    def test_rejects_non_finite_depth_and_rates(self):
+        with self.assertRaises(DampedCosineError):
+            validate_damped_cosine_config(10, 10, 3.0, float('nan'), 0.01, 0.0)
+        with self.assertRaises(DampedCosineError):
+            validate_damped_cosine_config(10, 10, 3.0, 0.95, float('inf'), 0.0)
+        with self.assertRaises(DampedCosineError):
+            validate_damped_cosine_config(10, 10, 3.0, 0.95, 0.01, float('nan'))
+        with self.assertRaises(DampedCosineError):
+            validate_damped_cosine_config(10, 10, 3.0, 0.95, 0.01, float('-inf'))
+
+    def test_rejects_non_finite_inflation_cap(self):
+        for bad in (float('nan'), float('inf'), float('-inf')):
+            with self.assertRaises(DampedCosineError):
+                validate_damped_cosine_config(10, 10, -0.5, 0.95, 0.01, 0.0,
+                                              inflate_max_lr=bad)
+        with self.assertRaises(DampedCosineError):
+            validate_damped_cosine_config(10, 10, -0.5, 0.95, 0.01, 0.0,
+                                          inflate_max_lr=None)
+
     def test_constructor_propagates_validation(self):
         optimizer = _make_optimizer()
         with self.assertRaises(DampedCosineError):

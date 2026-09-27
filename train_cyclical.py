@@ -543,6 +543,16 @@ if __name__ == '__main__':
     except ValueError as e:
         parser.error(str(e))
 
+    # Fail fast on invalid/non-finite damped-cosine numbers before any model or
+    # optimizer is created; the full T/P-dependent validation runs later.
+    if args.scheduler == 'damped_cosine':
+        try:
+            validate_damped_cosine_config(1, 1, args.dc_alpha, args.dc_d,
+                                          args.max_lr, args.min_lr,
+                                          inflate_max_lr=args.dc_inflate_max_lr)
+        except DampedCosineError as e:
+            parser.error('invalid damped_cosine configuration: {}'.format(e))
+
     im_size_tmp = tuple([int(item) for item in args.im_size.split(',')])
     tg_size_tmp = (im_size_tmp[0], im_size_tmp[0]) if len(im_size_tmp) == 1 else tuple(im_size_tmp[:2])
     if args.freesdg and args.freesdg_mix_policy == 'paper' and tg_size_tmp != (512, 512):

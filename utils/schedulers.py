@@ -45,15 +45,29 @@ class DampedCosineError(ValueError):
     """Raised when damped-cosine scheduler settings are invalid."""
 
 
+def _require_finite_number(name, value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise DampedCosineError(f"{name} must be a finite number, got {value!r}")
+
+
 def validate_damped_cosine_config(total_updates, period, alpha, d, lr_max, lr_min,
                                   inflate_max_lr=None):
-    """Validate damped-cosine settings; raise DampedCosineError with a clear message."""
-    if not isinstance(total_updates, int) or total_updates < 1:
+    """Validate damped-cosine settings; raise DampedCosineError with a clear message.
+
+    ``inflate_max_lr`` is validated and applied only when ``alpha < 0`` (the
+    envelope grows and must be capped). For ``alpha >= 0`` it is ignored, so a
+    non-inflating run is never constrained by it.
+    """
+    if isinstance(total_updates, bool) or not isinstance(total_updates, int) or total_updates < 1:
         raise DampedCosineError(
             f"total planned optimizer updates must be an integer >= 1, got {total_updates!r}")
-    if not isinstance(period, int) or period < 1:
+    if isinstance(period, bool) or not isinstance(period, int) or period < 1:
         raise DampedCosineError(
             f"oscillation period must be an integer >= 1 optimizer update, got {period!r}")
+    _require_finite_number("alpha", alpha)
+    _require_finite_number("d (oscillation depth)", d)
+    _require_finite_number("lr_max", lr_max)
+    _require_finite_number("lr_min", lr_min)
     if alpha <= -1:
         raise DampedCosineError(
             f"alpha must be > -1, got {alpha}: alpha <= -1 makes the envelope "
@@ -66,8 +80,10 @@ def validate_damped_cosine_config(total_updates, period, alpha, d, lr_max, lr_mi
     if lr_max <= lr_min:
         raise DampedCosineError(
             f"lr_max must be > lr_min, got lr_max={lr_max}, lr_min={lr_min}")
-    if inflate_max_lr is not None:
-        # lr(0) == lr_max already, so a cap at or below lr_max is contradictory
+    if alpha < 0:
+        # Inflation: a finite cap strictly above lr_max is required (lr(0) is
+        # already lr_max, so a cap at or below it is contradictory).
+        _require_finite_number("dc_inflate_max_lr", inflate_max_lr)
         if inflate_max_lr <= lr_max:
             raise DampedCosineError(
                 f"dc_inflate_max_lr must be > lr_max (lr(0) alone starts at lr_max={lr_max}), "
@@ -82,19 +98,24 @@ def _envelope(t, total_updates, alpha):
     return 1.0 / (1.0 + alpha * progress)
 
 
+def _capped_envelope(t, total_updates, alpha, lr_max, lr_min, inflate_max_lr):
+    """Envelope multiplier, capped only when inflating (alpha < 0)."""
+    envelope = _envelope(t, total_updates, alpha)
+    if alpha < 0 and inflate_max_lr is not None:
+        cap = (inflate_max_lr - lr_min) / (lr_max - lr_min)
+        if envelope > cap:
+            envelope = cap
+    return envelope
+
+
 def damped_cosine_lr(t, total_updates, period, alpha, d, lr_max, lr_min,
                      inflate_max_lr=None):
     """Closed-form damped-cosine learning rate at zero-based update index t.
 
-    With inflate_max_lr set, the envelope is clamped so the lr never exceeds
-    inflate_max_lr (relevant for alpha < 0, where it would otherwise grow to
-    lr_max / (1 + alpha) at the end).
+    The inflation cap applies only for alpha < 0 (where the envelope would
+    otherwise grow past lr_max up to lr_max / (1 + alpha) at the end).
     """
-    envelope = _envelope(t, total_updates, alpha)
-    if inflate_max_lr is not None:
-        cap = (inflate_max_lr - lr_min) / (lr_max - lr_min)
-        if envelope > cap:
-            envelope = cap
+    envelope = _capped_envelope(t, total_updates, alpha, lr_max, lr_min, inflate_max_lr)
     oscillation = (1.0 + d * math.cos(2.0 * math.pi * t / period)) / (1.0 + d)
     return lr_min + (lr_max - lr_min) * envelope * oscillation
 
@@ -104,13 +125,9 @@ def damped_cosine_max_lr(t, total_updates, alpha, lr_max, lr_min, inflate_max_lr
 
     This is the local maximum of the oscillation around t: with alpha > 0 it
     decays over training, with -1 < alpha < 0 it grows (capped at
-    inflate_max_lr when given).
+    inflate_max_lr when given). The cap applies only when alpha < 0.
     """
-    envelope = _envelope(t, total_updates, alpha)
-    if inflate_max_lr is not None:
-        cap = (inflate_max_lr - lr_min) / (lr_max - lr_min)
-        if envelope > cap:
-            envelope = cap
+    envelope = _capped_envelope(t, total_updates, alpha, lr_max, lr_min, inflate_max_lr)
     return lr_min + (lr_max - lr_min) * envelope
 
 
@@ -164,12 +181,10 @@ class DampedCosineLRSchedule:
         self._apply_lr(self.last_update)
 
     def _lr_for_group(self, t, group_lr_max, group_lr_min):
-        envelope = _envelope(t, self.total_updates, self.alpha)
-        if self.inflate_max_lr is not None:
-            # group-agnostic cap on the envelope multiplier keeps group ratios
-            cap = (self.inflate_max_lr - self.lr_min) / (self.lr_max - self.lr_min)
-            if envelope > cap:
-                envelope = cap
+        # group-agnostic envelope cap keeps the groups' lr ratios intact; it
+        # applies only while inflating (alpha < 0).
+        envelope = _capped_envelope(t, self.total_updates, self.alpha,
+                                    self.lr_max, self.lr_min, self.inflate_max_lr)
         oscillation = (1.0 + self.d * math.cos(2.0 * math.pi * t / self.period)) / (1.0 + self.d)
         return group_lr_min + (group_lr_max - group_lr_min) * envelope * oscillation
 
