@@ -102,6 +102,26 @@ class ClosedFormTests(unittest.TestCase):
                                restored._lr_for_group(17, 0.01, 0.01 * 1e-8 / 0.01), places=15)
 
 
+class CosineBaselineTests(unittest.TestCase):
+    """Guard the original CosineAnnealingLR behavior the default path relies on."""
+
+    def test_stepped_cosine_matches_closed_form(self):
+        t_max, lr_max, total = 20, 0.01, 55
+        optimizer = torch.optim.Adam([torch.nn.Parameter(torch.zeros(1))], lr=lr_max)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=0)
+        lrs = [optimizer.param_groups[0]['lr']]
+        for _ in range(total - 1):
+            optimizer.step()
+            scheduler.step()
+            lrs.append(optimizer.param_groups[0]['lr'])
+        self.assertEqual(lrs[0], lr_max)
+        self.assertAlmostEqual(lrs[t_max], 0.0, places=12)
+        self.assertGreater(lrs[2 * t_max], 0.95 * lr_max)  # rises back after T_max
+        for t, lr in enumerate(lrs):
+            closed = lr_max * (1 + math.cos(math.pi * t / t_max)) / 2
+            self.assertAlmostEqual(lr, closed, places=12)
+
+
 class MaxQueryTests(unittest.TestCase):
     def test_query_matches_scanned_sequence_damped(self):
         total, period, alpha, d = 200, 37, 3.0, 0.95
