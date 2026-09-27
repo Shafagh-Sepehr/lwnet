@@ -213,9 +213,29 @@ Expected effect: FR-U2 variants change capacity and full-resolution feature inte
 
 ### Damped Cosine Scheduler
 
-This checkout retains the original `CosineAnnealingLR` scheduler. It has no `utils/schedulers.py` and no `--scheduler damped_cosine` CLI option, so no damped-cosine command is available on this branch. Do not combine scheduler flags with the FreeSDG examples above. If the separate `damped_cosine` branch is checked out, consult that branch's `--help` before using its scheduler-specific command.
+This checkout provides an optional damped-cosine learning-rate schedule alongside the original default cosine schedule. Select it with `--scheduler damped_cosine`; when `--scheduler` is omitted the original `CosineAnnealingLR` behavior is unchanged.
 
-The separate scheduler work describes a full cosine oscillation with an envelope: `alpha > 0` damps peaks, `alpha = 0` removes damping but is not the original cosine scheduler, and `-1 < alpha < 0` inflates peaks subject to an optional cap. The default cosine behavior in this branch is unchanged.
+```bash
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 2/2 --model_name wnet --scheduler damped_cosine --max_lr 0.01 --dc_alpha 3.0 --dc_d 0.95 --dc_period 0 --save_path wnet_drive_damped --device cpu
+```
+
+The schedule follows a closed-form full-cosine oscillation with an envelope over the planned optimizer updates. Settings:
+
+- `--dc_alpha` (default `3.0`): envelope decay strength. `alpha > 0` damps the peaks over training; `alpha = 0` removes the envelope decay (but is *not* the original cosine schedule); `-1 < alpha < 0` inflates the peaks over training. Values `<= -1` are rejected.
+- `--dc_d` (default `0.95`): oscillation depth in `[0, 1]`. With `d < 1` the trough does not reach `--min_lr` exactly.
+- `--dc_period` (default `0`): oscillation period in optimizer updates. `0` selects an automatic period of `2 x cycle_lens[0] x updates_per_epoch`, matching the original scheduler's two-cycle oscillation.
+- `--dc_inflate_max_lr` (default `0.1`): hard cap on the learning rate in inflation mode (`alpha < 0`). It must be greater than `--max_lr`; it has no effect for `alpha >= 0`.
+
+`--max_lr` is the *initial* peak (`lr(0) = max_lr`). Negative `alpha` can raise later peaks above it, up to `--dc_inflate_max_lr`. The scheduler paces itself by actual optimizer updates, so it respects `--grad_acc_steps` (exactly one step per update), unlike the original cosine schedule, which steps `grad_acc_steps + 1` times per update. When training with pseudo-labels, the update count is computed from the extended training set.
+
+Preview the exact highest learning rate of a planned damped-cosine run without training:
+
+```bash
+python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 2/2 --model_name wnet --scheduler damped_cosine --dc_show_max_lr --device cpu
+```
+
+`--dc_show_max_lr` prints the largest rate among the planned optimizer updates, its update index, the planned total updates, and the resolved period, then exits without creating an experiment directory. It is computed from the actual training loader (including any pseudo-label extension) and requires `--scheduler damped_cosine`; it is rejected for `--scheduler cosine`.
+
 
 ## Compatibility and Caveats
 

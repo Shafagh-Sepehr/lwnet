@@ -1,4 +1,4 @@
-import sys, json, os, argparse, copy, random, shutil
+import sys, json, os, argparse, math, copy, random, shutil
 from shutil import copyfile, rmtree
 import os.path as osp
 from datetime import datetime
@@ -22,6 +22,10 @@ from utils.structural_saliency import StructuralSaliencyTarget
 from segmentation_losses import build_segmentation_loss
 
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from utils.schedulers import (DampedCosineLRSchedule, DampedCosineError,
+                              validate_damped_cosine_config,
+                              damped_cosine_schedule_max)
 
 # argument parsing
 parser = argparse.ArgumentParser()
@@ -92,6 +96,24 @@ parser.add_argument('--loss_dice_weight', type=float, default=0.0, help='weight 
 parser.add_argument('--loss_cldice_weight', type=float, default=0.0, help='weight of the foreground soft-clDice topology term')
 parser.add_argument('--loss_boundary_weight', type=float, default=0.0, help='weight of the signed-distance boundary term (distances in pixels: resolution/scale dependent, pilot at 0.01)')
 parser.add_argument('--loss_cldice_iters', type=int, default=10, help='soft-skeleton erosion iterations for the clDice term')
+# Learning-rate schedule selection. Defaults preserve the original CosineAnnealingLR behavior.
+parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'damped_cosine'],
+                    help="learning-rate schedule: 'cosine' (original CosineAnnealingLR behavior, default) "
+                         "or 'damped_cosine' (decaying full-cosine oscillation)")
+parser.add_argument('--dc_alpha', type=float, default=3.0,
+                    help='damped_cosine: envelope decay strength; must be > -1 '
+                         '(negative values in (-1, 0) inflate the lr peaks above max_lr over training)')
+parser.add_argument('--dc_inflate_max_lr', type=float, default=0.1,
+                    help='damped_cosine: hard cap on the lr for inflation mode (alpha < 0); '
+                         'the growing envelope is clamped so lr never exceeds this. '
+                         'Must be > max_lr. No effect for alpha >= 0 [default: %(default)s]')
+parser.add_argument('--dc_show_max_lr', action='store_true',
+                    help='query mode: print the highest lr the run will ever hit with these settings '
+                         '(and at which cycle/epoch/update), then exit without training')
+parser.add_argument('--dc_d', type=float, default=0.95, help='damped_cosine: oscillation depth in [0, 1]')
+parser.add_argument('--dc_period', type=int, default=0,
+                    help='damped_cosine: oscillation period in optimizer updates '
+                         '(0 = automatic: 2 x cycle_len x updates/epoch, matching the original scheduler oscillation)')
 
 
 def validate_freesdg_args(args):
@@ -165,6 +187,9 @@ def reduce_lr(optimizer, epoch, factor=0.1, verbose=True):
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
+
+def is_damped(scheduler):
+    return getattr(scheduler, 'kind', 'cosine') == 'damped_cosine'
 
 def format_loss_components(split, comps, criterion, extra_weights=None):
     # One line of unweighted values, CLI weights, and weighted contributions;
@@ -296,8 +321,12 @@ def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
             tr_lr = get_lr(optimizer)
             if i_batch % (grad_acc_steps+1) == 0:  # for grad_acc_steps=0, this is always True
                 optimizer.step()
-                for _ in range(grad_acc_steps+1):
-                    scheduler.step() # for grad_acc_steps=0, this means once
+                if is_damped(scheduler):
+                    scheduler.step()  # exactly one scheduler step per optimizer update
+                else:
+                    # original behavior, preserved for the default scheduler
+                    for _ in range(grad_acc_steps+1):
+                        scheduler.step() # for grad_acc_steps=0, this means once
                 optimizer.zero_grad()
         if assess:
             logits_all.extend(logits.detach())
@@ -561,6 +590,61 @@ if __name__ == '__main__':
     else:
         sys.exit('im_size should be a number or a tuple of two numbers')
 
+    ### QUERY MODE: print the highest lr the planned run will hit, then exit.
+    # The update count comes from the ACTUAL training loader (batch size and,
+    # when pseudo-labels are used, the extended dataset), not the source CSV.
+    # No experiment directory is created and no outputs are written.
+    if args.dc_show_max_lr:
+        if args.scheduler != 'damped_cosine':
+            parser.error('--dc_show_max_lr reports a damped-cosine maximum and requires '
+                         '--scheduler damped_cosine (got --scheduler {})'.format(args.scheduler))
+        csv_train_q = args.csv_train
+        csv_val_q = csv_train_q.replace('train', 'val')
+        label_values_q = [0, 85, 170, 255] if 'av' in csv_train_q else [0, 255]
+        train_loader_q, _ = get_train_val_loaders(
+            csv_path_train=csv_train_q, csv_path_val=csv_val_q, batch_size=bs,
+            tg_size=tg_size, label_values=label_values_q, num_workers=0,
+            freesdg_cfg=freesdg_cfg,
+            need_distance_map=('av' not in csv_train_q) and args.loss_boundary_weight > 0,
+            need_structural_saliency=args.structural_saliency)
+        if args.csv_test is not None:
+            from utils.get_loaders import build_pseudo_dataset
+            tr_im_list, tr_gt_list, tr_mask_list = build_pseudo_dataset(
+                csv_train_q, args.csv_test, args.path_test_preds)
+            train_loader_q.dataset.im_list = tr_im_list
+            train_loader_q.dataset.gt_list = tr_gt_list
+            train_loader_q.dataset.mask_list = tr_mask_list
+        updates_per_epoch = math.ceil(len(train_loader_q) / (grad_acc_steps + 1))
+        total_updates = updates_per_epoch * sum(cycle_lens)
+        period = args.dc_period if args.dc_period != 0 else 2 * cycle_lens[0] * updates_per_epoch
+        try:
+            validate_damped_cosine_config(total_updates, period, args.dc_alpha, args.dc_d,
+                                          max_lr, min_lr, inflate_max_lr=args.dc_inflate_max_lr)
+        except DampedCosineError as e:
+            sys.exit('invalid damped_cosine configuration: {}'.format(e))
+        best_lr, best_t, ties = damped_cosine_schedule_max(
+            total_updates, period, args.dc_alpha, args.dc_d, max_lr, min_lr,
+            inflate_max_lr=args.dc_inflate_max_lr)
+        global_epoch0 = best_t // updates_per_epoch  # 0-based global epoch
+        rem, cycle, epoch_in_cycle = global_epoch0, len(cycle_lens), cycle_lens[-1]
+        for c, clen in enumerate(cycle_lens, 1):
+            if rem < clen:
+                cycle, epoch_in_cycle = c, rem + 1
+                break
+            rem -= clen
+        print('* damped_cosine over {} cycles x {} epochs ({} optimizer updates, {}/epoch, period {}):'.format(
+            len(cycle_lens), cycle_lens[0], total_updates, updates_per_epoch, period))
+        print('  highest lr ever hit: {:.6e}  (alpha={}, d={}, lr_max={}, lr_min={}, inflate_max_lr={})'.format(
+            best_lr, args.dc_alpha, args.dc_d, max_lr, min_lr, args.dc_inflate_max_lr))
+        print('  first reached at: cycle {}/{}, epoch {}/{} (global epoch {}, optimizer update {}/{})'.format(
+            cycle, len(cycle_lens), epoch_in_cycle, cycle_lens[cycle-1],
+            global_epoch0 + 1, best_t + 1, total_updates))
+        if ties > 1:
+            print('  note: {} updates reach this same value (repeated capped peaks)'.format(ties))
+        print('  update count computed from the actual training loader'
+              '{}'.format(' (pseudo-label-extended)' if args.csv_test is not None else ''))
+        sys.exit(0)
+
     do_not_save = str2bool(args.do_not_save)
     if do_not_save is False:
         save_path = args.save_path
@@ -692,9 +776,40 @@ if __name__ == '__main__':
 
 
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=cycle_lens[0] * len(train_loader), eta_min=0)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cycle_lens[0] * len(train_loader), eta_min=0)
+    # Optimizer updates per epoch: one every (grad_acc_steps+1) batches, matching
+    # the loop condition `i_batch % K == 0`. Computed after the pseudo-label
+    # branch above so an extended train set is accounted for.
+    updates_per_epoch = math.ceil(len(train_loader) / (grad_acc_steps + 1))
+    total_planned_updates = updates_per_epoch * sum(cycle_lens)
+
+    if args.scheduler == 'damped_cosine':
+        # The original scheduler oscillation spans TWO cycles (decay over one
+        # T_max = cycle_lens[0]*len(train_loader) step cycle, rise over the next),
+        # so the matching damped-cosine period is 2*cycle_lens[0]*updates_per_epoch.
+        dc_period = args.dc_period if args.dc_period != 0 else 2 * cycle_lens[0] * updates_per_epoch
+        try:
+            validate_damped_cosine_config(total_planned_updates, dc_period, args.dc_alpha, args.dc_d,
+                                          max_lr, min_lr, inflate_max_lr=args.dc_inflate_max_lr)
+        except DampedCosineError as e:
+            sys.exit('invalid damped_cosine configuration: {}'.format(e))
+        scheduler = DampedCosineLRSchedule(optimizer, total_updates=total_planned_updates,
+                                           period=dc_period, alpha=args.dc_alpha, d=args.dc_d,
+                                           lr_max=max_lr, lr_min=min_lr,
+                                           inflate_max_lr=args.dc_inflate_max_lr)
+    else:
+        # original scheduler, behavior preserved exactly (eta_min=0 regardless of --min_lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cycle_lens[0] * len(train_loader), eta_min=0)
     setattr(optimizer, 'max_lr', max_lr)  # store it inside the optimizer for accessing to it later
     setattr(scheduler, 'cycle_lens', cycle_lens)
+    setattr(scheduler, 'kind', args.scheduler)
+    setattr(scheduler, 'total_updates', total_planned_updates)
+
+    print('* Scheduler: {} -- {} planned optimizer updates ({} per epoch x {} epochs)'.format(
+        args.scheduler, total_planned_updates, updates_per_epoch, sum(cycle_lens)))
+    if args.scheduler == 'damped_cosine':
+        print('  damped_cosine: alpha={}, d={}, period={} updates, lr_max={}, lr_min={}, inflate_max_lr={}'.format(
+            args.dc_alpha, args.dc_d, dc_period, max_lr, min_lr, args.dc_inflate_max_lr))
+
 
 
     print('* Starting to train\n','-' * 10)
