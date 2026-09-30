@@ -236,7 +236,10 @@ def format_metric_transition(previous, candidate):
 def run_one_epoch(loader, model, criterion, optimizer=None, scheduler=None,
         grad_acc_steps=0, assess=False, structural_target_builder=None,
         structural_saliency_weight=0.0):
-    device='cuda' if next(model.parameters()).is_cuda else 'cpu'
+    # Preserve the actual model device (including the selected GPU index,
+    # e.g. cuda:1) instead of collapsing every CUDA model to the current
+    # device. All supervised tensors below are moved to this same device.
+    device = next(model.parameters()).device
     train = optimizer is not None  # if we are in training mode there will be an optimizer and train=True here
 
     # if train:
@@ -720,6 +723,13 @@ if __name__ == '__main__':
 
     print("* Creating Dataloaders, batch size = {}, workers = {}".format(bs, args.num_workers))
     train_loader, val_loader = get_train_val_loaders(csv_path_train=csv_train, csv_path_val=csv_val, batch_size=bs, tg_size=tg_size, label_values=label_values, num_workers=args.num_workers, freesdg_cfg=freesdg_cfg, need_distance_map=need_distance_map, need_structural_saliency=args.structural_saliency)
+
+    # Raffe executes per sample inside TrainDataset.__getitem__. Report the
+    # actual routing once so a cuda:N / workers combination is visible in logs.
+    if args.freesdg and args.freesdg_aug_mode in ('raffe_filter', 'raffe_smooth_mix'):
+        aug_device = getattr(train_loader.dataset, 'freesdg_aug_device', None) or 'cpu'
+        print('* Raffe routing: model={}; Raffe augmentation={} ({} workers)'.format(
+            args.device, aug_device, args.num_workers))
 
     # grad_acc_steps: if I want to train with a fake_bs=K but the actual bs I want is bs=N, then you use
     # grad_acc_steps = N/K - 1.

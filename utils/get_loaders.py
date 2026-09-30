@@ -36,7 +36,8 @@ def _restore_transform_rng_state(state):
 
 class TrainDataset(Dataset):
     def __init__(self, csv_path, transforms=None, label_values=None, freesdg_cfg=None,
-                 need_distance_map=False, need_structural_saliency=False):
+                 need_distance_map=False, need_structural_saliency=False,
+                 freesdg_aug_device=None):
         df = pd.read_csv(csv_path)
         self.im_list = df.im_paths
         self.gt_list = df.gt_paths
@@ -57,6 +58,12 @@ class TrainDataset(Dataset):
         # Opt-in FreeSDG FMAug configuration. None/disabled ->
         # the original code path below executes verbatim.
         self.freesdg_cfg = freesdg_cfg
+        # Internal Raffe execution device for the TRAINING dataset, resolved by
+        # get_train_val_loaders. None means "fall back to the config device"
+        # (used only by direct construction); the loader factory always sets an
+        # explicit value so worker processes never enable CUDA (see
+        # resolve_train_raffe_aug_device).
+        self.freesdg_aug_device = freesdg_aug_device
         self.freesdg_resize = None  # hoisted deterministic resize (set by get_train_val_datasets)
         self.freesdg_raw_transforms = None
         self.freesdg_augmented_transforms = None
@@ -165,9 +172,30 @@ class TrainDataset(Dataset):
             # original CPU path and return to CPU for the required PIL bridge.
             raffe_mode = self.freesdg_cfg.get('aug_mode') in (
                 'raffe_filter', 'raffe_smooth_mix')
-            raffe_device = torch.device(
-                self.freesdg_cfg.get('device', 'cpu')) if raffe_mode else None
+            if raffe_mode:
+                effective_device = self.freesdg_aug_device
+                if effective_device is None:
+                    effective_device = self.freesdg_cfg.get('device', 'cpu')
+                raffe_device = torch.device(effective_device)
+            else:
+                raffe_device = None
             if raffe_device is not None and raffe_device.type == 'cuda':
+                # Defensive guard: __getitem__ runs in DataLoader worker
+                # subprocesses when num_workers > 0. CUDA must never be
+                # initialized there; the loader factory routes workers to CPU
+                # (resolve_train_raffe_aug_device) and run_one_epoch moves the
+                # collated batch to the selected model device afterwards.
+                worker_info = torch.utils.data.get_worker_info()
+                if worker_info is not None:
+                    raise RuntimeError(
+                        'Raffe CUDA augmentation must not run in a DataLoader '
+                        'worker (worker id {}): effective Raffe augmentation '
+                        'device is {}. CUDA is only safe in the main process. '
+                        'Use --num_workers 0 for the GPU augmentation path, or '
+                        '--num_workers > 0 to preprocess Raffe on CPU; the '
+                        'collated batch is then moved to the selected model '
+                        'device by run_one_epoch.'.format(
+                            worker_info.id, raffe_device))
                 img01 = img01.to(raffe_device)
                 mask01 = mask01.to(raffe_device)
             disable_color_jitter = self.freesdg_cfg.get(
@@ -325,13 +353,48 @@ def build_pseudo_dataset(train_csv_path, test_csv_path, path_to_preds):
     return train_im_list, train_gt_list, train_mask_list
 
 
-def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), label_values=(0, 255), freesdg_cfg=None, need_distance_map=False, need_structural_saliency=False):
+RAFFE_AUG_MODES = ('raffe_filter', 'raffe_smooth_mix')
+
+
+def resolve_train_raffe_aug_device(freesdg_cfg, num_workers=None):
+    """Resolve the internal Raffe augmentation device for the TRAINING dataset.
+
+    Raffe runs inside ``TrainDataset.__getitem__``. With ``num_workers > 0``
+    DataLoader executes that method in worker subprocesses, so CUDA must not be
+    used there: workers preprocess on CPU and ``run_one_epoch`` moves the
+    collated batch to the selected model device. With ``num_workers == 0``
+    ``__getitem__`` runs in the main process and the requested ``cuda:N`` is
+    kept so the existing GPU augmentation path is preserved.
+
+    ``num_workers is None`` (a direct ``get_train_val_datasets`` call with no
+    DataLoader worker count) defaults to the safe CPU path.
+
+    Returns a device string, or None when Raffe is not active.
+    """
+    if freesdg_cfg is None or not freesdg_cfg.get('enabled', False):
+        return None
+    if freesdg_cfg.get('aug_mode') not in RAFFE_AUG_MODES:
+        return None
+    requested = str(freesdg_cfg.get('device', 'cpu'))
+    if not requested.startswith('cuda'):
+        return 'cpu'
+    if num_workers is None or num_workers > 0:
+        return 'cpu'
+    return requested
+
+
+def get_train_val_datasets(csv_path_train, csv_path_val, tg_size=(512, 512), label_values=(0, 255), freesdg_cfg=None, need_distance_map=False, need_structural_saliency=False, freesdg_aug_device=None):
 
     freesdg_enabled = freesdg_cfg is not None and freesdg_cfg.get('enabled', False)
     if freesdg_enabled:
         train_freesdg_cfg = dict(freesdg_cfg, role='train')
         val_freesdg_cfg = dict(freesdg_cfg, role='val')
-        train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values, freesdg_cfg=train_freesdg_cfg, need_distance_map=need_distance_map, need_structural_saliency=need_structural_saliency)
+        # Direct callers that do not go through get_train_val_loaders get the
+        # safe CPU default; only the loader factory (which knows the worker
+        # count) can opt into main-process CUDA augmentation.
+        if freesdg_aug_device is None:
+            freesdg_aug_device = resolve_train_raffe_aug_device(freesdg_cfg)
+        train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values, freesdg_cfg=train_freesdg_cfg, need_distance_map=need_distance_map, need_structural_saliency=need_structural_saliency, freesdg_aug_device=freesdg_aug_device)
         val_dataset = TrainDataset(csv_path=csv_path_val, label_values=label_values, freesdg_cfg=val_freesdg_cfg, need_distance_map=need_distance_map, need_structural_saliency=False)
     else:
         train_dataset = TrainDataset(csv_path=csv_path_train, label_values=label_values, need_distance_map=need_distance_map, need_structural_saliency=need_structural_saliency)
@@ -383,7 +446,10 @@ def get_train_val_loaders(csv_path_train, csv_path_val, batch_size=4, tg_size=(5
     # need_distance_map is the generic boundary-loss requirement; it is applied
     # to the validation loader as well because validation loss is calculated.
     # need_structural_saliency is training-only and is forced off for validation.
-    train_dataset, val_dataset = get_train_val_datasets(csv_path_train, csv_path_val, tg_size=tg_size, label_values=label_values, freesdg_cfg=freesdg_cfg, need_distance_map=need_distance_map, need_structural_saliency=need_structural_saliency)
+    # Raffe augmentation runs in __getitem__: keep the requested cuda:N for the
+    # main process when num_workers == 0, otherwise preprocess on CPU in workers.
+    train_aug_device = resolve_train_raffe_aug_device(freesdg_cfg, num_workers)
+    train_dataset, val_dataset = get_train_val_datasets(csv_path_train, csv_path_val, tg_size=tg_size, label_values=label_values, freesdg_cfg=freesdg_cfg, need_distance_map=need_distance_map, need_structural_saliency=need_structural_saliency, freesdg_aug_device=train_aug_device)
 
     train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available(), shuffle=True)
     val_loader = DataLoader(dataset=val_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())

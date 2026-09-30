@@ -170,6 +170,14 @@ python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 2/2 --mod
 
 Expected effect: frequency-domain views change the training input distribution while keeping paired masks aligned. Observed outcome: these modes are available and covered by smoke tests; no controlled performance claim is made.
 
+The Raffe modes (`raffe_filter`, `raffe_smooth_mix`) run once per sample inside the dataset, before the paired PIL transforms, so a Raffe view keeps the same geometry as its label. This interacts with `--num_workers`:
+
+- `--num_workers 0` runs the dataset in the main process, so `--device cuda:N` uses the existing GPU augmentation path on exactly that GPU.
+- `--num_workers N` (`N > 0`) preprocesses Raffe on CPU inside the DataLoader worker processes; the collated batch is then moved to the `--device cuda:N` model. No worker initializes CUDA, and each worker keeps its own augmentation RNG stream.
+- CPU `--device cpu` always augments on CPU for any worker count.
+
+Training prints the routing once, for example `* Raffe routing: model=cuda:0; Raffe augmentation=cpu (2 workers)`. Multiworker CPU preprocessing is not asserted to be faster than `--num_workers 0`; measure it for your data before relying on it.
+
 ### Loss Compositions
 
 The loss is `w_bce*BCE + w_dice*Dice + w_cldice*clDice + w_boundary*boundary`. Weights are independent and default to the original BCE behavior:
