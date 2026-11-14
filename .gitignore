@@ -1,21 +1,73 @@
-# Ignore python local caching files
-__pycache__
-**.idea
-# Ignore notebook checkpoints
-**.ipynb_checkpoints
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Notebook and editor state
+**.ipynb_checkpoints/
 **.ipynb
-# Vim files and python caches
+**.idea/
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
 *~
 *.swp
-*.pyc
+*.swo
 
+# Temporary and development files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.log
+*.out
+*.err
+*.prof
+*.trace
+archive/tmp/
+archive/work/
+.scratch/**/tmp/
+.scratch/**/work/
 
+# Machine-specific and local agent state
+# Agent definitions, plans, and settings stay visible; the LOCAL pre-commit hook
+# blocks accidental commits of .kilo/, .scratch/, and other AI-only paths.
+LWNET_MANAGER_PACK/LOCAL_PATHS.json
+.kilo/agent-manager.json
+.kilo/worktrees/
+
+# Large archives and smoke artifacts
+*.rar
+*.7z
+*.tar
+*.tgz
+*.tar.gz
+archive/archives/
+archive/results_smoke/
+results_smoke/
+
+# Data and generated results
 data
-
-# Ignore result directories
 # experiments/
 results/
 
+# Historical local directories
 instructions_vessels_training_testing
 manuscript_tmi
 manuscript_arxiv

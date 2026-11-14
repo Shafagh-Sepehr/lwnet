@@ -24,7 +24,7 @@ pip install torch torchvision
 pip install -r requirements.txt
 ```
 
-`environment.txt` is a historical Linux `@EXPLICIT` Conda export for Python 3.7 and CUDA 10.0. It is not a portable pip requirements file. Dataset preparation may additionally require `wget`, `unzip`, `tar`, or other platform tools.
+`archive/legacy_data/environment.txt` is a historical Linux `@EXPLICIT` Conda export for Python 3.7 and CUDA 10.0. It is not a portable pip requirements file. Dataset preparation may additionally require `wget`, `unzip`, `tar`, or other platform tools.
 
 The original broad downloader is:
 
