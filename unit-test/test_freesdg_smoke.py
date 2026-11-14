@@ -466,6 +466,121 @@ def test_20_9_loader_fov():
 
 
 # ---------------------------------------------------------------------------
+# §20.13 Raffe augmentation device routing through the DataLoader factory
+# ---------------------------------------------------------------------------
+
+def _raffe_cfg(mode, device="cpu", raw_prob=0.0):
+    return {
+        "enabled": True,
+        "raw_prob": raw_prob,
+        "test_input": "raw",
+        "anchor_w": 27,
+        "anchor_sigma": 9,
+        "ratio": 4.0,
+        "mixup_size": -1,
+        "mix_policy": "repo",
+        "seed": 0,
+        "aug_mode": mode,
+        "lwnet_aug_profile": "original",
+        "disable_aug_color_jitter": False,
+        "device": device,
+    }
+
+
+def test_20_13_raffe_worker_routing():
+    from utils.get_loaders import (
+        get_train_val_datasets,
+        get_train_val_loaders,
+        resolve_train_raffe_aug_device,
+    )
+
+    # --- resolver matrix (no dataset needed) ---------------------------------
+    for mode in ("raffe_filter", "raffe_smooth_mix"):
+        # num_workers == 0 keeps the requested cuda:N for the main process.
+        assert resolve_train_raffe_aug_device(
+            _raffe_cfg(mode, "cuda:1"), 0) == "cuda:1"
+        assert resolve_train_raffe_aug_device(
+            _raffe_cfg(mode, "cuda:0"), 0) == "cuda:0"
+        # any worker count forces CPU preprocessing regardless of model device.
+        for workers in (1, 2, 8):
+            assert resolve_train_raffe_aug_device(
+                _raffe_cfg(mode, "cuda:1"), workers) == "cpu"
+        # CPU stays CPU for every worker count.
+        for workers in (None, 0, 2):
+            assert resolve_train_raffe_aug_device(
+                _raffe_cfg(mode, "cpu"), workers) == "cpu"
+        # unknown worker count (direct dataset construction) -> safe CPU.
+        assert resolve_train_raffe_aug_device(
+            _raffe_cfg(mode, "cuda:0"), None) == "cpu"
+    # non-Raffe FreeSDG and disabled FreeSDG are left untouched.
+    assert resolve_train_raffe_aug_device(_raffe_cfg("fmaug", "cuda:0"), 0) is None
+    assert resolve_train_raffe_aug_device(
+        dict(_raffe_cfg("raffe_filter", "cuda:0"), enabled=False), 2) is None
+    assert resolve_train_raffe_aug_device(None, 0) is None
+
+    tmp = tempfile.mkdtemp(prefix="freesdg_routing_")
+    csv_path = _build_synthetic_dataset(tmp)
+    tg = (64, 64)
+
+    # --- loader factory sets the training dataset's effective device ---------
+    for mode in ("raffe_filter", "raffe_smooth_mix"):
+        # cuda:N requested with no workers -> main-process CUDA augmentation.
+        tr0, vl0 = get_train_val_loaders(
+            csv_path, csv_path, batch_size=2, tg_size=tg,
+            label_values=[0, 255], num_workers=0,
+            freesdg_cfg=_raffe_cfg(mode, "cuda:0"))
+        assert tr0.dataset.freesdg_aug_device == "cuda:0", mode
+        # validation is never Raffe-routed.
+        assert vl0.dataset.freesdg_aug_device is None, mode
+
+        # cuda:N requested with workers -> CPU workers, model device untouched.
+        tr2, _ = get_train_val_loaders(
+            csv_path, csv_path, batch_size=2, tg_size=tg,
+            label_values=[0, 255], num_workers=2,
+            freesdg_cfg=_raffe_cfg(mode, "cuda:0"))
+        assert tr2.dataset.freesdg_aug_device == "cpu", mode
+
+    # --- actual worker iteration stays on CPU --------------------------------
+    tr2, _ = get_train_val_loaders(
+        csv_path, csv_path, batch_size=2, tg_size=tg,
+        label_values=[0, 255], num_workers=2,
+        freesdg_cfg=_raffe_cfg("raffe_smooth_mix", "cuda:0"))
+    served = 0
+    for imgs, targets in tr2:
+        assert imgs.device.type == "cpu"
+        assert targets.device.type == "cpu"
+        served += imgs.shape[0]
+    assert served == 2
+
+    # --- explicit spawn exercises the same path on Linux fork defaults -------
+    ctx = torch.multiprocessing.get_context("spawn")
+    spawn_ds = tr2.dataset
+    spawn_loader = torch.utils.data.DataLoader(
+        spawn_ds, batch_size=2, num_workers=2, shuffle=False,
+        multiprocessing_context=ctx)
+    spawn_served = 0
+    for imgs, _ in spawn_loader:
+        assert imgs.device.type == "cpu"
+        spawn_served += imgs.shape[0]
+    assert spawn_served == 2
+
+    # --- a CUDA-routed dataset must refuse to run inside a worker ------------
+    cuda_ds, _ = get_train_val_datasets(
+        csv_path, csv_path, tg_size=tg, label_values=[0, 255],
+        freesdg_cfg=_raffe_cfg("raffe_filter", "cuda:0"),
+        freesdg_aug_device="cuda:0")
+    guard_loader = torch.utils.data.DataLoader(
+        cuda_ds, batch_size=1, num_workers=2, shuffle=False)
+    raised = False
+    try:
+        for _ in guard_loader:
+            pass
+    except RuntimeError as exc:
+        raised = "worker" in str(exc).lower() and "cuda" in str(exc).lower()
+    assert raised, "worker CUDA guard did not raise a clear RuntimeError"
+
+
+# ---------------------------------------------------------------------------
 # §20.10 W-Net integration (unchanged architecture, §14/§16)
 # ---------------------------------------------------------------------------
 
@@ -800,6 +915,7 @@ SECTIONS = [
     ("20.3b range contract", test_range_contract),
     ("20.8 worker RNG", test_20_8_worker_rng),
     ("20.9 loader / FOV", test_20_9_loader_fov),
+    ("20.13 Raffe worker routing", test_20_13_raffe_worker_routing),
     ("20.10 W-Net integration", test_20_10_wnet_integration),
     ("20.11 checkpoint round-trip", test_20_11_checkpoint_roundtrip),
     ("20.12 config coverage", test_20_12_config),
