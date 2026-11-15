@@ -35,10 +35,21 @@ Conventions (inspection of this checkout)
 
 References / attribution
 ------------------------
-* soft-clDice topology term and the soft-skeleton construction are adapted
-  from the official clDice implementation: https://github.com/jocpae/clDice
+* The soft-clDice term and the soft-skeleton construction are adapted from
+  the official clDice implementation: https://github.com/jocpae/clDice
   (Cloux et al., "clDice - a Novel Topology-Preserving Loss Function for
   Tubular Structure Segmentation").
+  This is our validated-form soft-clDice term -- skeleton-aware soft Dice on
+  probabilities (tprec/tsens harmonic mean) with an iterated soft skeleton --
+  and NOT a reproduction of FDPR-DBNet.  FDPR's printed total-variation
+  connectivity surrogate is uncomposed and is not implemented here.
+  Deliberate deviations from the upstream reference, preserved so this
+  project's ``bce_cldice020_i10`` control runs stay reproducible:
+  erosion is a 3x3 square min-pool (upstream uses the min of directional
+  1x3 and 3x1 erosions); residual terms accumulate additively (upstream's
+  current code saturates each skeleton pixel at 1); soft terms use
+  ``eps=1e-6`` (upstream ``smooth=1.0``) and reduce per image then average.
+  The clDice metric formula itself (tprec, tsens, 2*P*S/(P+S)) is unchanged.
 * The signed-distance boundary term follows the Kervadec-style
   probability-times-distance objective and the discrete distance-map
   convention of https://github.com/LIVIAETS/boundary-loss (utils.py).

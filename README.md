@@ -188,6 +188,10 @@ python train_cyclical.py --csv_train data/DRIVE/train.csv --cycle_lens 2/2 --mod
 
 Expected effect: Dice and topology terms emphasize foreground overlap and connectivity; the boundary term is resolution-dependent. Observed outcome: component values and weighted contributions are reported during training; no numerical improvement is claimed.
 
+`--loss_cldice_weight` defaults to `0.0` (term off). When positive it is **added** as a fourth term and never replaces BCE, Dice, or boundary. `--loss_cldice_iters` (default `10`) sets the soft-skeleton erosion steps. The implementation is the validated soft-clDice form — skeleton-aware differentiable Dice on sigmoid probabilities with an iterative soft skeleton — adapted from the official clDice code. It is **not** an FDPR-DBNet reproduction: FDPR's printed total-variation connectivity surrogate is uncomposed and not implemented here. The skeletonization convention (3x3 min-pooling erosion, additive residual accumulation) matches this project's existing `bce_cldice020_i10` control runs, so that family stays reproducible; `segmentation_losses.py` documents the exact deviations from upstream.
+
+The S1 screen for adding this term to the compound reference (`bce=1.0, dice=0.25, boundary=0.01`, `iters=10`) pre-declares one-at-a-time `--loss_cldice_weight` values `0.05`, `0.10`, `0.20`; `0.2` is the historical control weight, and larger values are not swept because the term would dominate the compound objective.
+
 ### Auxiliary Structural Saliency
 
 This is an auxiliary reconstruction task inspired by RaffeSDG. It uses the geometrically aligned original RGB image to build a Gaussian high-frequency target and branches from U-Net 1. It is not the full RaffeSDG attention-coupling architecture, and it does not add a second segmentation view:
