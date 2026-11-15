@@ -128,9 +128,15 @@ class UNet(nn.Module):
         down_activations.reverse()
         return x, tuple(down_activations)
 
-    def decode(self, x, down_activations, return_decoder_features=False, decoder_additions=None):
+    def decode(self, x, down_activations, return_decoder_features=False, decoder_additions=None,
+               decoder_fusions=None, decoder_fusion_inputs=None):
         if decoder_additions is not None and len(decoder_additions) != len(self.up_path):
             raise ValueError('decoder_additions must match the number of decoder stages')
+        if decoder_fusions is not None:
+            if len(decoder_fusions) != len(self.up_path):
+                raise ValueError('decoder_fusions must match the number of decoder stages')
+            if decoder_fusion_inputs is None or len(decoder_fusion_inputs) != len(self.up_path):
+                raise ValueError('decoder_fusion_inputs must match the number of decoder stages')
 
         decoder_features = []
         for i, up in enumerate(self.up_path):
@@ -145,6 +151,16 @@ class UNet(nn.Module):
                                 i, tuple(addition.shape), tuple(x.shape)))
                     x = x + addition       # not in-place
 
+            if decoder_fusions is not None:
+                fusion = decoder_fusions[i]
+                if fusion is not None:
+                    fusion_input = decoder_fusion_inputs[i]
+                    if fusion_input.shape != x.shape:
+                        raise RuntimeError(
+                            'decoder fusion shape mismatch at decoder stage {}: {} vs {}'.format(
+                                i, tuple(fusion_input.shape), tuple(x.shape)))
+                    x = fusion(x, fusion_input)
+
             decoder_features.append(x)
 
         logits = self.final(x)
@@ -152,13 +168,16 @@ class UNet(nn.Module):
             return logits, tuple(decoder_features)
         return logits
 
-    def forward(self, x, return_decoder_features=False, decoder_additions=None):
+    def forward(self, x, return_decoder_features=False, decoder_additions=None,
+                decoder_fusions=None, decoder_fusion_inputs=None):
         x, skips = self.encode(x)
         return self.decode(
             x,
             skips,
             return_decoder_features=return_decoder_features,
             decoder_additions=decoder_additions,
+            decoder_fusions=decoder_fusions,
+            decoder_fusion_inputs=decoder_fusion_inputs,
         )
 
 

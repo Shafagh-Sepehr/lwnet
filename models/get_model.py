@@ -4,6 +4,7 @@ from .res_unet_adrian import UNet as unet
 from .res_unet_adrian import AuxiliarySaliencyDecoder
 from .fr_u2 import FullResolutionMultiResU2
 from .fr_u2_lite import FullResolutionMultiResU2Lite
+from .cross_gate_fusion import FUSION_TYPES, build_cross_gate_fusion
 
 import torch
 import torch.nn.functional as F
@@ -119,6 +120,23 @@ def validate_structural_saliency(structural_saliency, model_name, n_classes, in_
         raise ValueError('structural_saliency_ratio must be finite.')
 
 
+def validate_cross_gate_fusion(cross_gate_fusion, model_name, u2_arch):
+    """Validate the opt-in U1-to-U2 half-scale fusion variant."""
+    if cross_gate_fusion not in FUSION_TYPES:
+        raise ValueError('cross_gate_fusion must be one of {}, got {!r}'.format(
+            FUSION_TYPES, cross_gate_fusion))
+    if cross_gate_fusion == 'none':
+        return cross_gate_fusion
+    if model_name not in ('wnet', 'big_wnet'):
+        raise ValueError(
+            'cross_gate_fusion is supported only for model_name "wnet" and "big_wnet"')
+    if u2_arch != 'unet':
+        raise ValueError(
+            'cross_gate_fusion requires u2_arch="unet"; the FR-U2 variants have no '
+            'decoder_additions seam')
+    return cross_gate_fusion
+
+
 def validate_u2_arch(u2_arch, fr_u2_base_channels, fr_u2_dilations,
                      model_name, cross_stage_bridge, fr_lite=False):
     if u2_arch not in U2_ARCHS:
@@ -190,6 +208,7 @@ def get_arch_options(cfg):
         'cross_stage_bridge_scales': get('cross_stage_bridge_scales', 'all'),
         'cross_stage_bridge_init': get('cross_stage_bridge_init', 0.0),
         'structural_saliency': get('structural_saliency', False),
+        'cross_gate_fusion': get('cross_gate_fusion', 'none'),
     }
 
 
@@ -246,11 +265,34 @@ class _BridgeGateContainer(torch.nn.Module):
         return name in self._parameters
 
 
+class _FusionModuleContainer(torch.nn.Module):
+    # Module counterpart of _BridgeGateContainer. The semantic scale name
+    # 'half' collides with the reserved nn.Module.half() method, so modules
+    # are registered directly into _modules and reached by subscript. Their
+    # state-dict names stay predictable (fusion_modules.half.<...>).
+    def __init__(self):
+        super().__init__()
+        self._fusion_names = []
+
+    def add(self, name, module):
+        self._modules[name] = module
+        self._fusion_names.append(name)
+
+    def items(self):
+        return [(n, self._modules[n]) for n in self._fusion_names]
+
+    def __getitem__(self, name):
+        return self._modules[name]
+
+    def __contains__(self, name):
+        return name in self._modules
+
+
 class wnet(torch.nn.Module):
     def __init__(self, n_classes=1, in_c=3, layers=(8,16,32), conv_bridge=True, shortcut=True, mode='train',
                  cross_stage_bridge='none', cross_stage_bridge_scales='all', cross_stage_bridge_init=0.0,
                  structural_saliency=False, u2_arch='unet', fr_u2_base_channels=8,
-                 fr_u2_dilations=(1, 2, 4, 2, 1), fr_lite=False):
+                 fr_u2_dilations=(1, 2, 4, 2, 1), fr_lite=False, cross_gate_fusion='none'):
         super(wnet, self).__init__()
         if fr_lite:
             if len(layers) != 3:
@@ -262,6 +304,13 @@ class wnet(torch.nn.Module):
             u2_arch = 'fr_multi'
             fr_u2_base_channels = 4
             fr_u2_dilations = (1, 2, 1)
+        if cross_gate_fusion not in FUSION_TYPES:
+            raise ValueError('cross_gate_fusion must be one of {}, got {!r}'.format(
+                FUSION_TYPES, cross_gate_fusion))
+        if cross_gate_fusion != 'none' and u2_arch != 'unet':
+            raise ValueError(
+                'cross_gate_fusion requires u2_arch="unet"; the FR-U2 variants have no '
+                'decoder_additions seam')
         self.unet1 = unet(in_c=in_c, n_classes=n_classes, layers=layers, conv_bridge=conv_bridge, shortcut=shortcut)
         if u2_arch == 'unet':
             self.unet2 = unet(in_c=in_c+n_classes, n_classes=n_classes, layers=layers, conv_bridge=conv_bridge, shortcut=shortcut)
@@ -288,6 +337,7 @@ class wnet(torch.nn.Module):
         self.cross_stage_bridge_scales = cross_stage_bridge_scales
         self.cross_stage_bridge_init = cross_stage_bridge_init
         self.structural_saliency = bool(structural_saliency)
+        self.cross_gate_fusion = cross_gate_fusion
 
         if self.structural_saliency:
             self.saliency_decoder = AuxiliarySaliencyDecoder(
@@ -324,6 +374,18 @@ class wnet(torch.nn.Module):
                     self.bridge_gates.add(scale_name, torch.nn.Parameter(
                         torch.full((1, channels, 1, 1), float(cross_stage_bridge_init))))
 
+        # Constructed last so enabling the fusion never shifts the
+        # initialization order (and therefore the weights) of existing modules.
+        self.fusion_modules = None
+        self.fusion_stage_index = None
+        if cross_gate_fusion != 'none':
+            fusion_stage_index = scale_names.index('half')
+            fusion_modules = _FusionModuleContainer()
+            fusion_modules.add('half', build_cross_gate_fusion(
+                cross_gate_fusion, decoder_channels[fusion_stage_index]))
+            self.fusion_modules = fusion_modules
+            self.fusion_stage_index = fusion_stage_index
+
     def _u1_input(self, x):
         """Adapt odd FR inputs without changing the existing U1 module.
 
@@ -356,43 +418,57 @@ class wnet(torch.nn.Module):
             additions[stage_index] = gate * u1_decoder_features[stage_index]
         return additions
 
+    def _needs_u1_decoder_features(self):
+        return self.cross_stage_bridge != 'none' or self.cross_gate_fusion != 'none'
+
+    def _build_decoder_kwargs(self, u1_decoder_features):
+        kwargs = {}
+        if self.cross_stage_bridge != 'none':
+            kwargs['decoder_additions'] = tuple(
+                self._build_bridge_additions(u1_decoder_features))
+        if self.cross_gate_fusion != 'none':
+            fusions = [None] * len(u1_decoder_features)
+            fusions[self.fusion_stage_index] = self.fusion_modules['half']
+            kwargs['decoder_fusions'] = tuple(fusions)
+            kwargs['decoder_fusion_inputs'] = tuple(u1_decoder_features)
+        return kwargs
+
     def forward(self, x):
         structural_enabled = (
             self.structural_saliency and self.training and self.mode == 'train')
+        needs_features = self._needs_u1_decoder_features()
 
         if structural_enabled:
             u1_input, spatial_size = self._u1_input(x)
             bottleneck, u1_skips = self.unet1.encode(u1_input)
 
-            if self.cross_stage_bridge == 'none':
-                x1 = self.unet1.decode(bottleneck, u1_skips)
-            else:
+            if needs_features:
                 x1, u1_decoder_features = self.unet1.decode(
                     bottleneck, u1_skips, return_decoder_features=True)
-                additions = self._build_bridge_additions(u1_decoder_features)
+            else:
+                x1 = self.unet1.decode(bottleneck, u1_skips)
 
             saliency = self.saliency_decoder(bottleneck, u1_skips)
             x1 = self._crop_to_input(x1, spatial_size)
             saliency = self._crop_to_input(saliency, spatial_size)
 
             u2_input = torch.cat([x, x1], dim=1)
-            if self.cross_stage_bridge == 'none':
-                x2 = self.unet2(u2_input)
+            if needs_features:
+                x2 = self.unet2(u2_input, **self._build_decoder_kwargs(u1_decoder_features))
             else:
-                x2 = self.unet2(u2_input, decoder_additions=tuple(additions))
+                x2 = self.unet2(u2_input)
 
             return x1, x2, saliency
 
-        if self.cross_stage_bridge == 'none':
+        if not needs_features:
             u1_input, spatial_size = self._u1_input(x)
             x1 = self._crop_to_input(self.unet1(u1_input), spatial_size)
             x2 = self.unet2(torch.cat([x, x1], dim=1))
         else:
             x1, u1_decoder_features = self.unet1(x, return_decoder_features=True)
-            additions = self._build_bridge_additions(u1_decoder_features)
             x2 = self.unet2(
                 torch.cat([x, x1], dim=1),
-                decoder_additions=tuple(additions))
+                **self._build_decoder_kwargs(u1_decoder_features))
 
         if self.mode != 'train':
             return x2
@@ -419,7 +495,7 @@ class wnet(torch.nn.Module):
 def get_arch(model_name, in_c=3, n_classes=1,
              cross_stage_bridge='none', cross_stage_bridge_scales='all', cross_stage_bridge_init=0.0,
              structural_saliency=False, u2_arch='unet', fr_u2_base_channels=8,
-             fr_u2_dilations=(1, 2, 4, 2, 1), fr_lite=False):
+             fr_u2_dilations=(1, 2, 4, 2, 1), fr_lite=False, cross_gate_fusion='none'):
 
     if fr_lite:
         u2_arch = 'fr_multi'
@@ -431,6 +507,8 @@ def get_arch(model_name, in_c=3, n_classes=1,
     u2_arch, fr_u2_base_channels, fr_u2_dilations = validate_u2_arch(
         u2_arch, fr_u2_base_channels, fr_u2_dilations, model_name,
         cross_stage_bridge, fr_lite=fr_lite)
+    cross_gate_fusion = validate_cross_gate_fusion(
+        cross_gate_fusion, model_name, u2_arch)
 
     if model_name == 'unet':
         model = unet(in_c=in_c, n_classes=n_classes, layers=[8,16,32], conv_bridge=True, shortcut=True)
@@ -441,13 +519,15 @@ def get_arch(model_name, in_c=3, n_classes=1,
                       cross_stage_bridge=cross_stage_bridge, cross_stage_bridge_scales=scales,
                       cross_stage_bridge_init=init, structural_saliency=structural_saliency,
                       u2_arch=u2_arch, fr_u2_base_channels=fr_u2_base_channels,
-                      fr_u2_dilations=fr_u2_dilations, fr_lite=fr_lite)
+                      fr_u2_dilations=fr_u2_dilations, fr_lite=fr_lite,
+                      cross_gate_fusion=cross_gate_fusion)
     elif model_name == 'big_wnet':
         model = wnet(in_c=in_c, n_classes=n_classes, layers=[8,16,32,64], conv_bridge=True, shortcut=True,
                       cross_stage_bridge=cross_stage_bridge, cross_stage_bridge_scales=scales,
                       cross_stage_bridge_init=init, structural_saliency=structural_saliency,
                       u2_arch=u2_arch, fr_u2_base_channels=fr_u2_base_channels,
-                      fr_u2_dilations=fr_u2_dilations, fr_lite=fr_lite)
+                      fr_u2_dilations=fr_u2_dilations, fr_lite=fr_lite,
+                      cross_gate_fusion=cross_gate_fusion)
 
     else: sys.exit('not a valid model_name, check models.get_model.py')
 

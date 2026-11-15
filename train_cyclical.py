@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from models.get_model import (
     get_arch, get_arch_options, validate_cross_stage_bridge,
-    validate_structural_saliency, validate_u2_arch,
+    validate_structural_saliency, validate_u2_arch, validate_cross_gate_fusion,
 )
 
 from utils.get_loaders import get_train_val_loaders
@@ -157,6 +157,13 @@ parser.add_argument('--cross_stage_bridge_scales', type=str, default='all',
                     help='all or a comma-separated subset of quarter,half,full')
 parser.add_argument('--cross_stage_bridge_init', type=float, default=0.0,
                     help='initial raw bridge gate value; A1 default is exactly 0.0')
+
+# Opt-in U1-to-U2 half-scale cross-gated fusion (FDPR C3-corrected prose form).
+# 'literal' is the labeled degenerate CFF-literal comparator, never the headline.
+parser.add_argument('--cross_gate_fusion', choices=['none', 'corrected', 'plain', 'literal'],
+                    default='none',
+                    help='U1->U2 half-scale fusion variant: corrected (C3-corrected), '
+                         'plain (matched-budget control), or literal (CFF-literal comparator)')
 
 
 def compare_op(metric):
@@ -546,6 +553,12 @@ if __name__ == '__main__':
     except ValueError as e:
         parser.error(str(e))
 
+    try:
+        args.cross_gate_fusion = validate_cross_gate_fusion(
+            args.cross_gate_fusion, args.model_name, args.u2_arch)
+    except ValueError as e:
+        parser.error(str(e))
+
     # Fail fast on invalid/non-finite damped-cosine numbers before any model or
     # optimizer is created; the full T/P-dependent validation runs later.
     if args.scheduler == 'damped_cosine':
@@ -757,6 +770,7 @@ if __name__ == '__main__':
             print('  FR fusion stages=3')
     print('  cross_stage_bridge={} scales={} init={}'.format(
         args.cross_stage_bridge, args.cross_stage_bridge_scales, args.cross_stage_bridge_init))
+    print('  cross_gate_fusion={}'.format(args.cross_gate_fusion))
     print('  structural_saliency={}'.format(args.structural_saliency))
     print('  trainable_params={}'.format(
         sum(p.numel() for p in model.parameters() if p.requires_grad)))
