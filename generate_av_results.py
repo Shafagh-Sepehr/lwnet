@@ -105,7 +105,7 @@ def create_pred(model, tens, mask, coords_crop, original_sz, tta='no', device=No
 def save_pred(prob_pred, save_results_path, im_name):
     prob, pred = prob_pred
     os.makedirs(save_results_path, exist_ok=True)
-    im_name = im_name.rsplit('/', 1)[-1]
+    im_name = im_name.replace('\\', '/').rsplit('/', 1)[-1]
     save_name = osp.join(save_results_path, im_name[:-4] + '.png')
 
     with warnings.catch_warnings():
