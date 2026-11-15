@@ -31,7 +31,7 @@ def get_labels_preds(path_to_preds, csv_path):
     all_preds = []
     all_gts = []
     for i in range(len(gt_list)):
-        im_path = im_list[i].rsplit('/', 1)[-1]
+        im_path = im_list[i].replace('\\', '/').rsplit('/', 1)[-1]
         pred_path = osp.join(path_to_preds, im_path[:-4] + '.png')
         gt_path = gt_list[i]
         mask_path = mask_list[i]

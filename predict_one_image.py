@@ -188,7 +188,7 @@ if __name__ == '__main__':
     model_path = args.model_path
     im_path = args.im_path
     im_loc = osp.dirname(im_path)
-    im_name = im_path.rsplit('/', 1)[-1]
+    im_name = im_path.replace('\\', '/').rsplit('/', 1)[-1]
 
     mask_path = args.mask_path
     result_path = args.result_path

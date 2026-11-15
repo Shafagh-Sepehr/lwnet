@@ -80,7 +80,7 @@ def create_pred(model, tens, mask, coords_crop, original_sz, tta='no', device=No
     return full_pred
 
 def save_pred(full_pred, save_results_path, im_name):
-    im_name = im_name.rsplit('/', 1)[-1]
+    im_name = im_name.replace('\\', '/').rsplit('/', 1)[-1]
     save_name = osp.join(save_results_path, im_name[:-4] + '.png')
     # NOTE (unrelated upstream bug fix, kept separate from FreeSDG logic):
     # Windows-generated CSVs mix '/' and '\' in paths, so im_name may still
