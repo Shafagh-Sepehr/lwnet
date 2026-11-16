@@ -119,12 +119,19 @@ class UNet(nn.Module):
 
         self.final = nn.Conv2d(layers[0], n_classes, kernel_size=1)
 
-    def encode(self, x):
+    def encode(self, x, bottleneck_transform=None):
         x = self.first(x)
         down_activations = []
         for down in self.down_path:
             down_activations.append(x)
             x = down(x)
+        if bottleneck_transform is not None:
+            transformed = bottleneck_transform(x)
+            if transformed.shape != x.shape:
+                raise RuntimeError(
+                    'bottleneck transform shape mismatch: {} vs {}'.format(
+                        tuple(transformed.shape), tuple(x.shape)))
+            x = transformed
         down_activations.reverse()
         return x, tuple(down_activations)
 
@@ -176,8 +183,9 @@ class UNet(nn.Module):
         return logits
 
     def forward(self, x, return_decoder_features=False, decoder_additions=None,
-                decoder_fusions=None, decoder_fusion_inputs=None, decoder_gates=None):
-        x, skips = self.encode(x)
+                decoder_fusions=None, decoder_fusion_inputs=None, decoder_gates=None,
+                bottleneck_transform=None):
+        x, skips = self.encode(x, bottleneck_transform=bottleneck_transform)
         return self.decode(
             x,
             skips,
