@@ -129,7 +129,7 @@ class UNet(nn.Module):
         return x, tuple(down_activations)
 
     def decode(self, x, down_activations, return_decoder_features=False, decoder_additions=None,
-               decoder_fusions=None, decoder_fusion_inputs=None):
+               decoder_fusions=None, decoder_fusion_inputs=None, decoder_gates=None):
         if decoder_additions is not None and len(decoder_additions) != len(self.up_path):
             raise ValueError('decoder_additions must match the number of decoder stages')
         if decoder_fusions is not None:
@@ -137,6 +137,8 @@ class UNet(nn.Module):
                 raise ValueError('decoder_fusions must match the number of decoder stages')
             if decoder_fusion_inputs is None or len(decoder_fusion_inputs) != len(self.up_path):
                 raise ValueError('decoder_fusion_inputs must match the number of decoder stages')
+        if decoder_gates is not None and len(decoder_gates) != len(self.up_path):
+            raise ValueError('decoder_gates must match the number of decoder stages')
 
         decoder_features = []
         for i, up in enumerate(self.up_path):
@@ -161,6 +163,11 @@ class UNet(nn.Module):
                                 i, tuple(fusion_input.shape), tuple(x.shape)))
                     x = fusion(x, fusion_input)
 
+            if decoder_gates is not None:
+                gate = decoder_gates[i]
+                if gate is not None:
+                    x = gate(x)
+
             decoder_features.append(x)
 
         logits = self.final(x)
@@ -169,7 +176,7 @@ class UNet(nn.Module):
         return logits
 
     def forward(self, x, return_decoder_features=False, decoder_additions=None,
-                decoder_fusions=None, decoder_fusion_inputs=None):
+                decoder_fusions=None, decoder_fusion_inputs=None, decoder_gates=None):
         x, skips = self.encode(x)
         return self.decode(
             x,
@@ -178,6 +185,7 @@ class UNet(nn.Module):
             decoder_additions=decoder_additions,
             decoder_fusions=decoder_fusions,
             decoder_fusion_inputs=decoder_fusion_inputs,
+            decoder_gates=decoder_gates,
         )
 
 

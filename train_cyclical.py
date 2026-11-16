@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from models.get_model import (
     get_arch, get_arch_options, validate_cross_stage_bridge,
     validate_structural_saliency, validate_u2_arch, validate_cross_gate_fusion,
+    validate_proto_gate,
 )
 
 from utils.get_loaders import get_train_val_loaders
@@ -164,6 +165,13 @@ parser.add_argument('--cross_gate_fusion', choices=['none', 'corrected', 'plain'
                     default='none',
                     help='U1->U2 half-scale fusion variant: corrected (C3-corrected), '
                          'plain (matched-budget control), or literal (CFF-literal comparator)')
+
+# Opt-in U2 decoder prototype channel gate (FDPR C2-corrected prose intent).
+# 'se' is the amplification-only control proxy; 'plain' is the matched conv control.
+parser.add_argument('--proto_gate', choices=['none', 'corrected', 'se', 'plain'],
+                    default='none',
+                    help='U2 decoder prototype gate variant: corrected (C2-corrected, gain 0..2), '
+                         'se (amplification-only control, gain 1..2), or plain (matched conv control)')
 
 
 def compare_op(metric):
@@ -559,6 +567,12 @@ if __name__ == '__main__':
     except ValueError as e:
         parser.error(str(e))
 
+    try:
+        args.proto_gate = validate_proto_gate(
+            args.proto_gate, args.model_name, args.u2_arch)
+    except ValueError as e:
+        parser.error(str(e))
+
     # Fail fast on invalid/non-finite damped-cosine numbers before any model or
     # optimizer is created; the full T/P-dependent validation runs later.
     if args.scheduler == 'damped_cosine':
@@ -771,6 +785,7 @@ if __name__ == '__main__':
     print('  cross_stage_bridge={} scales={} init={}'.format(
         args.cross_stage_bridge, args.cross_stage_bridge_scales, args.cross_stage_bridge_init))
     print('  cross_gate_fusion={}'.format(args.cross_gate_fusion))
+    print('  proto_gate={}'.format(args.proto_gate))
     print('  structural_saliency={}'.format(args.structural_saliency))
     print('  trainable_params={}'.format(
         sum(p.numel() for p in model.parameters() if p.requires_grad)))
