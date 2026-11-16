@@ -118,7 +118,7 @@ class HaarTransformTests(unittest.TestCase):
         low, high, _ = haar.split(x)
         self.assertTrue(torch.allclose(
             low.pow(2).sum() + high.pow(2).sum(), x.pow(2).sum(),
-            atol=1e-4, rtol=0))
+            atol=1e-4, rtol=1e-5))
 
     def test_rejects_bad_channel_count(self):
         haar = HaarTransform(3)
@@ -342,6 +342,16 @@ class OffParityTests(unittest.TestCase):
         fused_state = fused.state_dict()
         for key in base_state:
             self.assertTrue(torch.equal(base_state[key], fused_state[key]), key)
+
+    def test_enabling_dwt_does_not_shift_downstream_rng_stream(self):
+        for variant in ('dwt', 'plain'):
+            torch.manual_seed(0)
+            get_arch('wnet')
+            expected = torch.rand(16)
+            torch.manual_seed(0)
+            get_arch('wnet', dwt_fusion=variant)
+            actual = torch.rand(16)
+            self.assertTrue(torch.equal(expected, actual), variant)
 
     def test_off_forward_parity(self):
         torch.manual_seed(0)

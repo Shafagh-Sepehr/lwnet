@@ -144,6 +144,52 @@ class ModuleShapeTests(unittest.TestCase):
             self.assertTrue(torch.equal(out, x), name)
 
 
+class SEStraightThroughClampTests(unittest.TestCase):
+    def test_negative_scale_forward_identity_with_live_gradient(self):
+        for seed in range(3):
+            torch.manual_seed(seed)
+            module = SEProtoGate(16)
+            _randomize_gate(module)
+            with torch.no_grad():
+                module.gate_scale.fill_(-0.01)
+            x = torch.randn(2, 16, 32, 32)
+            gain = module.channel_gain(x)
+            self.assertEqual(float(gain.min()), 1.0, seed)
+            self.assertEqual(float(gain.max()), 1.0, seed)
+            loss = ((module(x) - 2.0 * x) ** 2).mean()
+            module.zero_grad()
+            loss.backward()
+            grad = module.gate_scale.grad
+            self.assertIsNotNone(grad, seed)
+            self.assertTrue(torch.isfinite(grad).all(), seed)
+            self.assertNotEqual(float(grad), 0.0, seed)
+            optimizer = torch.optim.Adam(module.parameters(), lr=0.05)
+            optimizer.step()
+            self.assertGreater(float(module.gate_scale.detach()), 0.0, seed)
+            recovered = module.channel_gain(x)
+            self.assertGreater(float(recovered.min()), 1.0, seed)
+            self.assertLess(float(recovered.max()), 2.0, seed)
+
+    def test_se_gate_trains_from_init_across_seeds(self):
+        for seed in range(3):
+            torch.manual_seed(seed)
+            module = SEProtoGate(16)
+            x = torch.randn(2, 16, 32, 32)
+            initial_weight = module.prototype.weight.detach().clone()
+            optimizer = torch.optim.Adam(module.parameters(), lr=0.01)
+            for _ in range(3):
+                optimizer.zero_grad()
+                out = module(x)
+                ((out - 2.0 * x) ** 2).mean().backward()
+                optimizer.step()
+            self.assertGreater(float(module.gate_scale.detach()), 0.0, seed)
+            gain = module.channel_gain(x)
+            self.assertGreater(float(gain.min()), 1.0, seed)
+            self.assertLess(float(gain.max()), 2.0, seed)
+            moved = (module.prototype.weight.detach() - initial_weight).abs().sum()
+            self.assertGreater(float(moved), 0.0, seed)
+
+
 class FullModelStageTests(unittest.TestCase):
     def test_gates_apply_at_half_16ch_and_full_8ch_only(self):
         torch.manual_seed(0)
@@ -265,6 +311,16 @@ class InitIdentityAndOffParityTests(unittest.TestCase):
         gated_state = gated.state_dict()
         for key in base_state:
             self.assertTrue(torch.equal(base_state[key], gated_state[key]), key)
+
+    def test_enabling_gate_does_not_shift_downstream_rng_stream(self):
+        for variant in ('corrected', 'se', 'plain'):
+            torch.manual_seed(0)
+            get_arch('wnet')
+            expected = torch.rand(16)
+            torch.manual_seed(0)
+            get_arch('wnet', proto_gate=variant)
+            actual = torch.rand(16)
+            self.assertTrue(torch.equal(expected, actual), variant)
 
     def test_off_forward_parity(self):
         torch.manual_seed(0)
@@ -481,6 +537,38 @@ class OptimizerSmokeTests(unittest.TestCase):
             out = model(inputs)
         self.assertEqual(tuple(out.shape), (2, 1, 64, 64))
         self.assertTrue(torch.isfinite(out).all())
+
+    def test_se_full_model_trains_from_init_across_seeds(self):
+        for seed in range(3):
+            torch.manual_seed(seed)
+            model = get_arch('wnet', cross_stage_bridge='scalar',
+                             proto_gate='se')
+            initial = {name: param.detach().clone()
+                       for name, param in model.proto_gate_modules.named_parameters()
+                       if param.dim() > 1}
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+            inputs = torch.randn(2, 3, 64, 64)
+            for _ in range(3):
+                model.train()
+                x1, x2 = model(inputs)
+                loss = ((x1 - 2.0 * x1.detach()) ** 2).mean() + \
+                    ((x2 - 2.0 * x2.detach()) ** 2).mean()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            moved = 0.0
+            for name, param in model.proto_gate_modules.named_parameters():
+                if param.dim() > 1:
+                    moved += float((param.detach() - initial[name]).abs().sum())
+            self.assertGreater(moved, 0.0, seed)
+            for name, gate in model.proto_gate_modules.items():
+                self.assertGreater(float(gate.gate_scale.detach()), 0.0,
+                                   (seed, name))
+                fake = torch.randn(1, gate.prototype.in_channels, 16, 16)
+                with torch.no_grad():
+                    gain = gate.channel_gain(fake)
+                self.assertGreater(float(gain.min()), 1.0, (seed, name))
+                self.assertLess(float(gain.max()), 2.0, (seed, name))
 
 
 if __name__ == '__main__':

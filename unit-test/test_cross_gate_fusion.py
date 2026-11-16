@@ -242,6 +242,16 @@ class OffParityTests(unittest.TestCase):
         for key in base_state:
             self.assertTrue(torch.equal(base_state[key], fused_state[key]), key)
 
+    def test_enabling_fusion_does_not_shift_downstream_rng_stream(self):
+        for variant in ('corrected', 'plain', 'literal'):
+            torch.manual_seed(0)
+            get_arch('wnet')
+            expected = torch.rand(16)
+            torch.manual_seed(0)
+            get_arch('wnet', cross_gate_fusion=variant)
+            actual = torch.rand(16)
+            self.assertTrue(torch.equal(expected, actual), variant)
+
     def test_off_forward_parity(self):
         torch.manual_seed(0)
         default = get_arch('wnet')

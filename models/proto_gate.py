@@ -13,9 +13,11 @@ Variants:
     corrected: g = 2 * sigmoid(p) in (0, 2). Zero-initialized 1x1 convolution
         makes g = 1 exactly at initialization; suppression (g < 1) is
         available during training. This is the headline C2-corrected form.
-    se: g = 1 + clamp(scale, 0, 1) * sigmoid(p) in (1, 2). Amplification-only
-        control-grade proxy for the closest honest MPCR-literal behavior.
-        It is not a faithful MPCR implementation.
+    se: g = 1 + s * sigmoid(p) in [1, 2), s = straight-through clamp(scale, 0, 1):
+        forward uses the clamped scale, backward passes the gradient through
+        the unclamped raw scale so the branch cannot freeze at identity.
+        Amplification-only control-grade proxy for the closest honest
+        MPCR-literal behavior. It is not a faithful MPCR implementation.
     plain: out = f + Conv1x1(f), no gate. Parameter-matched plain-capacity
         control (same 1x1 parameter count as corrected), zero-initialized.
 """
@@ -47,7 +49,7 @@ class CorrectedProtoGate(nn.Module):
 
 
 class SEProtoGate(nn.Module):
-    """Amplification-only control: g = 1 + s * sigmoid(p), s = clamp(scale, 0, 1)."""
+    """Amplification-only control: g = 1 + s * sigmoid(p), s = straight-through clamp(scale, 0, 1)."""
 
     def __init__(self, channels):
         super(SEProtoGate, self).__init__()
@@ -57,7 +59,9 @@ class SEProtoGate(nn.Module):
         self.gate_scale = nn.Parameter(torch.zeros(()))
 
     def channel_gain(self, x):
-        scale = self.gate_scale.clamp(0.0, 1.0)
+        raw = self.gate_scale
+        clamped = raw.clamp(0.0, 1.0)
+        scale = raw + (clamped - raw).detach()
         return 1.0 + scale * torch.sigmoid(self.prototype(_global_average(x)))
 
     def forward(self, x):

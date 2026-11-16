@@ -452,38 +452,46 @@ class wnet(torch.nn.Module):
 
         # Constructed last so enabling the fusion never shifts the
         # initialization order (and therefore the weights) of existing modules.
-        self.fusion_modules = None
-        self.fusion_stage_index = None
-        if cross_gate_fusion != 'none':
-            fusion_stage_index = scale_names.index('half')
-            fusion_modules = _FusionModuleContainer()
-            fusion_modules.add('half', build_cross_gate_fusion(
-                cross_gate_fusion, decoder_channels[fusion_stage_index]))
-            self.fusion_modules = fusion_modules
-            self.fusion_stage_index = fusion_stage_index
+        # The RNG save/restore brackets only these opt-in construction sites:
+        # their initialization draws must not perturb the downstream stream
+        # (DataLoader shuffle and augmentation), so same-seed enabled and
+        # disabled arms stay paired. The draws themselves are unchanged.
+        _new_modules_rng_state = torch.get_rng_state()
+        try:
+            self.fusion_modules = None
+            self.fusion_stage_index = None
+            if cross_gate_fusion != 'none':
+                fusion_stage_index = scale_names.index('half')
+                fusion_modules = _FusionModuleContainer()
+                fusion_modules.add('half', build_cross_gate_fusion(
+                    cross_gate_fusion, decoder_channels[fusion_stage_index]))
+                self.fusion_modules = fusion_modules
+                self.fusion_stage_index = fusion_stage_index
 
-        # U2 decoder prototype gates: half (16ch) and full (8ch) stages.
-        # Also constructed last for the same RNG/state-dict reason.
-        self.proto_gate_modules = None
-        self.proto_gate_stage_names = {}
-        if proto_gate != 'none':
-            proto_gate_modules = _ProtoGateContainer()
-            for scale_name in ('half', 'full'):
-                if scale_name not in scale_names:
-                    continue
-                stage_index = scale_names.index(scale_name)
-                proto_gate_modules.add(scale_name, build_proto_gate(
-                    proto_gate, decoder_channels[stage_index]))
-                self.proto_gate_stage_names[stage_index] = scale_name
-            self.proto_gate_modules = proto_gate_modules
+            # U2 decoder prototype gates: half (16ch) and full (8ch) stages.
+            # Also constructed last for the same RNG/state-dict reason.
+            self.proto_gate_modules = None
+            self.proto_gate_stage_names = {}
+            if proto_gate != 'none':
+                proto_gate_modules = _ProtoGateContainer()
+                for scale_name in ('half', 'full'):
+                    if scale_name not in scale_names:
+                        continue
+                    stage_index = scale_names.index(scale_name)
+                    proto_gate_modules.add(scale_name, build_proto_gate(
+                        proto_gate, decoder_channels[stage_index]))
+                    self.proto_gate_stage_names[stage_index] = scale_name
+                self.proto_gate_modules = proto_gate_modules
 
-        # U2 encoder bottleneck Haar-DWT split/fuse (32ch at H/4 for the
-        # standard wnet, 64ch for big_wnet). Constructed after every existing
-        # module so enabling it never shifts their initialization.
-        self.dwt_fusion_module = None
-        if dwt_fusion != 'none':
-            self.dwt_fusion_module = build_dwt_fusion(
-                dwt_fusion, layers[-1])
+            # U2 encoder bottleneck Haar-DWT split/fuse (32ch at H/4 for the
+            # standard wnet, 64ch for big_wnet). Constructed after every existing
+            # module so enabling it never shifts their initialization.
+            self.dwt_fusion_module = None
+            if dwt_fusion != 'none':
+                self.dwt_fusion_module = build_dwt_fusion(
+                    dwt_fusion, layers[-1])
+        finally:
+            torch.set_rng_state(_new_modules_rng_state)
 
     def _u1_input(self, x):
         """Adapt odd FR inputs without changing the existing U1 module.
